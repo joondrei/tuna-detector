@@ -1,0 +1,139 @@
+"""Shared, dependency-light helpers used by the pipeline modules.
+
+Everything here was previously defined in the notebook cells:
+`fixed_rngs`, `seed_worker`, `make_metrics`, `_resolve_device`, `_sanitize`,
+`_atomic_torch_save`, `_flat_params`, `_jsonable`.
+
+The leading underscores are kept so the call sites in `training.py` stay
+identical to the notebook version.
+"""
+import os
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+from torcheval.metrics import (BinaryAccuracy, BinaryAUROC, BinaryF1Score,
+                               BinaryRecall)
+
+__all__ = ["fixed_rngs", "seed_worker", "make_metrics", "rng_generator",
+           "_resolve_device", "_sanitize", "_atomic_torch_save",
+           "_summary", "_flat_params", "_jsonable"]
+
+
+# --------------------------------------------------------------------- rngs
+def fixed_rngs(seed=42, deterministic=True, warn_only=True):
+    """Seed every RNG used by the preprocess -> train -> eval pipeline."""
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.use_deterministic_algorithms(True, warn_only=warn_only)
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(False)
+    return rng_generator(seed)
+
+
+def rng_generator(seed=42):
+    """Seeded torch generator for DataLoader shuffling / workers."""
+    return torch.Generator().manual_seed(int(seed))
+
+
+def seed_worker(worker_id):
+    """Reseed numpy/random inside DataLoader worker processes."""
+    worker_seed = torch.initial_seed() % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+# ---------------------------------------------------------------- device/io
+def _resolve_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _atomic_torch_save(payload, path):
+    """Write to a temp file then rename: never leaves a truncated checkpoint."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------ metrics
+def make_metrics(device, threshold=0.5):
+    """torcheval binary metrics take PROBABILITIES and threshold internally."""
+    return {
+        "accuracy": BinaryAccuracy(threshold=threshold, device=device),
+        "recall": BinaryRecall(threshold=threshold, device=device),
+        "auroc": BinaryAUROC(device=device),
+        "f1": BinaryF1Score(threshold=threshold, device=device),
+    }
+
+
+# ------------------------------------------------------- config serialising
+def _sanitize(obj):
+    """Make configs safe for torch.load(..., weights_only=True)."""
+    if isinstance(obj, dict):
+        return {str(k): _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().clone()
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    return repr(obj)                   # callables (scaling fns) -> string
+
+
+def _summary(value):
+    """Short, stable, comparable text for values a param cannot hold.
+
+    Never uses repr() of tensors/functions: those carry memory addresses or
+    tensor dumps that make runs look different when they are identical.
+    """
+    if isinstance(value, torch.Tensor):
+        return f"tensor{tuple(value.shape)}"
+    if isinstance(value, (list, tuple)):
+        if all(isinstance(v, (str, int, float, bool, type(None))) for v in value):
+            return ",".join(str(v) for v in value)
+        return f"<{len(value)} items>"
+    if callable(value):
+        return getattr(value, "__name__", type(value).__name__)
+    return str(value)
+
+
+def _flat_params(config, prefix=""):
+    """Flatten a nested config into {str: primitive} so params stay filterable."""
+    flat = {}
+    for key, value in config.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, dict):
+            flat.update(_flat_params(value, prefix=f"{name}."))
+        elif isinstance(value, (str, int, float, bool, type(None))):
+            flat[name] = "None" if value is None else value
+        else:
+            flat[name] = _summary(value)
+    return flat
+
+
+def _jsonable(obj):
+    """Same job as _flat_params but keeps nesting, for mlflow.log_dict."""
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    return _summary(obj)

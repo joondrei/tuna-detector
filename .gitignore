@@ -1,0 +1,8 @@
+.env
+.venv
+.python-version
+uv.lock
+old
+data/*
+**/__pycache__/
+ai_detection.egg-info

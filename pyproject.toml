@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-detection"
+version = "0.1.0"
+description = "AI image-detection pipeline."
+requires-python = ">=3.12"
+
+# All third-party imports of configs/, models/ and pipeline/.
+#   configs/filters.py          -> torch
+#   configs/pipeline_config.py  -> models.model, .filters
+#   models/model.py             -> torch
+#   pipeline/preprocessing.py   -> torch, torchvision, pyarrow, PIL
+#   pipeline/training.py        -> torch, loguru (+ optional mlflow)
+#   pipeline/utils.py           -> numpy, torch, torcheval
+
+dependencies = [
+    "torch==2.15.0",
+    "torchvision==0.29.2",
+    "pyarrow==25.0.1",
+    "pillow==13.0.0",
+    "numpy==2.5.4",
+    "torcheval==0.0.7",
+    "loguru==0.7.3",
+]
+
+[project.optional-dependencies]
+
+mlflow = ["mlflow==3.17.2"]
+databricks = ["databricks-sdk==0.158.0"]
+
+# Convenience: everything, including the optional experiment tracker and SDK.
+all = [
+    "mlflow==3.17.2",
+    "databricks-sdk==0.158.0",
+]
+
+[tool.setuptools]
+packages = [
+    "configs",
+    "models",
+    "pipeline",
+]

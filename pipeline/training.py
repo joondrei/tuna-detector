@@ -42,7 +42,7 @@ from configs.pipeline_config import SEED
 from .preprocessing import FeatureDataset
 from .utils import (_atomic_torch_save, _flat_params, _jsonable, _resolve_device,
                     _sanitize, fixed_rngs, make_metrics, prune_checkpoints,
-                    seed_worker)
+                    seed_worker, timeit)
 
 __all__ = ["TrainConfig", "EarlyStopping", "CheckpointStore", "NullTracker",
            "MlflowTracker", "NullValidator", "CallableValidator", "Evaluator",
@@ -619,6 +619,7 @@ class Trainer:
                 "seed": self.seed}
 
     # ---------------------------------------------------------------- build
+    @timeit
     def build(self):
         cfg = self.cfg
         self.gen = fixed_rngs(self.seed)
@@ -647,6 +648,7 @@ class Trainer:
                          "samples": [], "best": {}, "stopped_early": False}
         return self
 
+    @timeit
     def _make_loader(self, dataset):
         cfg = self.cfg
         kwargs = dict(batch_size=cfg.batch_size, num_workers=cfg.dataset_workers,
@@ -656,6 +658,7 @@ class Trainer:
         return DataLoader(dataset, **kwargs)
 
     # --------------------------------------------------------------- resume
+    @timeit
     def restore(self):
         """Load model/optimizer/RNG/history; returns True when a checkpoint was used."""
         cfg = self.cfg
@@ -758,6 +761,7 @@ class Trainer:
                 "epoch_train_time": epoch_train_time
                 }
 
+    @timeit
     def validate(self):
         """Delegate to the validator; NullValidator returns None (no-op)."""
         return self.validation(self.model)
@@ -788,6 +792,7 @@ class Trainer:
                             if torch.cuda.is_available() else None},
         }
 
+    @timeit
     def _record(self, epoch, train, val):
         self.history["loss"].append(train["loss"])
         self.history["metrics"].append(train["metrics"])
@@ -819,6 +824,7 @@ class Trainer:
             "global_step": float(self.global_step),
         })
 
+    @timeit
     def _checkpoint(self, epoch, train, val, score):
         """Checkpoint + best model + early stopping. Returns True to stop."""
         cfg = self.cfg
@@ -850,6 +856,7 @@ class Trainer:
         return False
 
     # ------------------------------------------------------------------ fit
+    @timeit
     def fit(self):
         if self.model is None:
             self.build()
@@ -895,6 +902,7 @@ class Trainer:
         self.tracker.end("FINISHED")
         return self.result()
 
+    @timeit
     def _finalize(self):
         cfg = self.cfg
 

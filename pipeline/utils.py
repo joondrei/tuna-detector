@@ -15,6 +15,13 @@ import numpy as np
 import torch
 from torcheval.metrics import (BinaryAccuracy, BinaryAUROC, BinaryF1Score,
                                BinaryRecall)
+from loguru import logger
+from collections.abc import Callable
+import time
+from typing import ParamSpec, TypeVar
+from functools import wraps
+P = ParamSpec("P")
+R = TypeVar("R")
 
 __all__ = ["fixed_rngs", "seed_worker", "make_metrics", "rng_generator",
            "prune_checkpoints", "_resolve_device", "_sanitize", "_atomic_torch_save",
@@ -178,3 +185,21 @@ def _jsonable(obj):
     if isinstance(obj, (str, int, float, bool, type(None))):
         return obj
     return _summary(obj)
+
+def timeit(func: Callable[P, R]) -> Callable[P, R]:
+    """Measure and log the execution time of a function.
+
+    :param func: The function whose execution time is to be measured.
+    :return: A wrapped function that logs its execution duration.
+    """
+
+    @wraps(func)
+    def timeit_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        total_time = end_time - start_time
+        logger.info(f"Function {func.__name__} Took {total_time:.4f} seconds")
+        return result
+
+    return timeit_wrapper

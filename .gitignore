@@ -6,3 +6,4 @@ old
 data/*
 **/__pycache__/
 ai_detection.egg-info
+checkpoints

@@ -1,6 +1,6 @@
 """
 `processing_parameters` / `training_parameters` keep the exact key names used by
-the notebook, so `Trainer(processing_parameters, build_model, training_parameters)`
+the notebook, so `Trainer(processing_parameters, build_custom_resnet_model, training_parameters)`
 works unchanged. Two notebook-only values are replaced by portable ones:
 
   texture_filter        torch tensor           -> DEFAULT_TEXTURE_FILTER
@@ -12,12 +12,8 @@ Filters live in `configs.filters`; the model in `models.model`.
 import os
 from pathlib import Path
 
-from models.model import CustomResNet18, build_model
+from models.model import CustomResNet18, build_custom_resnet_model
 from .filters import DEFAULT_TEXTURE_FILTER, build_spatial_filters
-
-__all__ = ["REPO_ROOT", "DATA_DIR", "SEED", "TRAIN_PATTERN", "VAL_PATTERN",
-           "TEST_PATTERN", "processing_parameters", "training_parameters",
-           "build_model", "CustomResNet18"]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -63,6 +59,7 @@ training_parameters = {
     # ---- checkpointing / early stopping --------------------------------
     "checkpoint_dir": "checkpoints",   
     "checkpoint_every": 1,             # 0 -> no per-epoch checkpoints
+    "keep_checkpoints": 5,             # no. before chkpoint pruning 
     "monitor": "auroc",                # key of eval_fn's dict; "loss" -> train loss
     "monitor_mode": None,              # None -> "min" for loss, "max" otherwise
     "early_stopping_patience": 3,      # None/0 -> disabled

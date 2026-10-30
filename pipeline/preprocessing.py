@@ -37,13 +37,14 @@ from configs.filters import (DEFAULT_TEXTURE_FILTER, SPATIAL_FILTERS,
                              build_spatial_filters, default_spatial_filters)
 
 
+FEATURE_NAMES = ("residuals", "tc", "prepatch", "poor", "rich", "fft_poor", "fft_rich")
 
 # ------------------------------------------------------------------ config
 class ProcessingConfig:
     """Validates `processing_parameters` for the preprocessing pipeline."""
 
     LABELTYPES = ("binary", "multiclass")
-    FEATURE_NAMES = ("residuals", "tc", "prepatch", "poor", "rich", "fft_poor", "fft_rich")
+    
 
     def __init__(self, filepattern, features=None, colorspace="RGB", labeltype="binary",
                  augment=False, resize_img=True, img_size=256, n_patches=64,

@@ -15,7 +15,7 @@
 # factory, validation, tracker), so each piece can be tested alone.
 #
 # Depends on .utils (rngs, metrics, config serialising, atomic io),
-# .preprocessing (DatasetPreprocessing), loguru (all logging) and, only for
+# .preprocessing (FeatureDataset), loguru (all logging) and, only for
 # MlflowTracker, mlflow.
 # =============================================================================
 import dataclasses
@@ -33,16 +33,16 @@ from torch.utils.data import DataLoader
 
 try:                                   # optional: NullTracker needs no mlflow
     import mlflow
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.errors.platform import ResourceDoesNotExist
 except ImportError:                    # pragma: no cover
     mlflow = None
 
-# the refactored dataset is API- and numerically-compatible with the notebook's
-# `DatasetPreprocessing` (same kwargs, same yielded dict), so it is the default
-# dataset factory here.
 from configs.pipeline_config import SEED
-from .preprocessing import FeatureDataset as DatasetPreprocessing
+from .preprocessing import FeatureDataset
 from .utils import (_atomic_torch_save, _flat_params, _jsonable, _resolve_device,
-                    _sanitize, fixed_rngs, make_metrics, seed_worker)
+                    _sanitize, fixed_rngs, make_metrics, prune_checkpoints,
+                    seed_worker)
 
 __all__ = ["TrainConfig", "EarlyStopping", "CheckpointStore", "NullTracker",
            "MlflowTracker", "NullValidator", "CallableValidator", "Evaluator",
@@ -67,6 +67,7 @@ class TrainConfig:
 
     checkpoint_dir: str = "checkpoints"
     checkpoint_every: int = 1
+    keep_checkpoints: int = 5          # how many epoch_*.pt to keep; 0 disables pruning
     monitor: str = "loss"
     monitor_mode: Optional[str] = None
     early_stopping_patience: Optional[int] = None
@@ -86,6 +87,8 @@ class TrainConfig:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
         if self.checkpoint_every is not None and self.checkpoint_every < 0:
             raise ValueError(f"checkpoint_every must be >= 0, got {self.checkpoint_every}")
+        if self.keep_checkpoints is not None and self.keep_checkpoints < 0:
+            raise ValueError(f"keep_checkpoints must be >= 0, got {self.keep_checkpoints}")
 
     @classmethod
     def from_dict(cls, params):
@@ -154,12 +157,17 @@ class EarlyStopping:
 
 # ------------------------------------------------------------- checkpoints
 class CheckpointStore:
-    """_atomic_torch_save provides safe recovery """
+    """_atomic_torch_save provides safe recovery; epoch files are pruned to `keep`."""
 
-    def __init__(self, directory, every=1):
+    def __init__(self, directory, every=1, keep=5):
         self.dir = Path(directory or "checkpoints")
         self.every = int(every or 0)
+        self.keep = keep
         self.dir.mkdir(parents=True, exist_ok=True)
+
+    def prune(self):
+        """Drop all but the `keep` newest epoch_*.pt files; best/last always survive."""
+        return prune_checkpoints(self.dir, self.keep)
 
     def path(self, name):
         return self.dir / f"{name}.pt"
@@ -247,8 +255,26 @@ class MlflowTracker(NullTracker):
                                "use NullTracker to train without tracking")
         if self.tracking_uri:
             mlflow.set_tracking_uri(self.tracking_uri)
+            logger.debug(f"MLflow tracking URI set to: {mlflow.get_tracking_uri()}")
         if self.experiment:
-            mlflow.set_experiment(self.experiment)
+            if mlflow.get_tracking_uri() == "databricks":
+                w = WorkspaceClient()
+                logger.debug("Connected to Databricks")
+                exp_dir = "/".join(self.experiment.split("/")[:-1])
+                try:
+                    w.workspace.get_status(exp_dir)
+                    logger.debug(f"Directory already exists: {exp_dir}")
+                except ResourceDoesNotExist:
+                    w.workspace.mkdirs(exp_dir)
+                    logger.success(f"Directory created: {exp_dir}")
+                except Exception as e:
+                    logger.error(f"Error creating experiment directory")
+                    raise e
+                finally:
+                    mlflow.set_experiment(self.experiment)
+                    logger.success(f"MLflow experiment ready: {self.experiment}")
+            else:
+                mlflow.set_experiment(self.experiment)
         self._run = mlflow.start_run(run_name=run_name or self.default_run_name)
         self.run_id = self._run.info.run_id
         if tags:
@@ -287,15 +313,17 @@ class MlflowTracker(NullTracker):
         upto = len(losses) if upto is None else min(int(upto), len(losses))
         val_hist = history.get("val") or []
         for e in range(upto):
-            mlflow.log_metric("loss", float(losses[e]), step=e)
+            mlflow.log_metric("loss", float(losses[e]), step=e + 1)
             if e < len(history.get("metrics") or []):
-                mlflow.log_metrics({k: float(v) for k, v in history["metrics"][e].items()}, step=e)
+                mlflow.log_metrics({k: float(v) for k, v in history["metrics"][e].items()},
+                                   step=e + 1)
             if e < len(val_hist) and isinstance(val_hist[e], dict):
-                mlflow.log_metrics({f"val_{k}": float(v) for k, v in val_hist[e].items()}, step=e)
+                mlflow.log_metrics({f"val_{k}": float(v) for k, v in val_hist[e].items()},
+                                   step=e + 1)
             if e < len(history.get("epoch_time") or []):
-                mlflow.log_metric("epoch_time", float(history["epoch_time"][e]), step=e)
+                mlflow.log_metric("epoch_time", float(history["epoch_time"][e]), step=e + 1)
             if e < len(history.get("samples") or []):
-                mlflow.log_metric("samples", float(history["samples"][e]), step=e)
+                mlflow.log_metric("samples", float(history["samples"][e]), step=e + 1)
         if upto:
             logger.info("replayed {} historical epoch(s) into run {}", upto, self.run_id)
 
@@ -374,7 +402,7 @@ class Evaluator(NullValidator):
 
     def __init__(self, loader=None, filepattern=None, batch_size=64, workers=0,
                  max_samples=None, threshold=0.5, criterion=None,
-                 dataset_factory=DatasetPreprocessing, metric_factory=None,
+                 dataset_factory=FeatureDataset, metric_factory=None,
                  pin_memory=None, device=None):
         self.loader = loader
         self.filepattern = filepattern
@@ -510,7 +538,7 @@ class Trainer:
 
     def __init__(self, processing, model, training, seed=SEED,
                  eval_fn=None, eval_loader=None, validation=None, tracker=None,
-                 dataset_factory=DatasetPreprocessing,
+                 dataset_factory=FeatureDataset,
                  metric_factory=make_metrics,
                  device=None):
         self.proc = dict(processing)
@@ -599,7 +627,8 @@ class Trainer:
         self.dataloader = self._make_loader(self.dataset)
         self.validation.build_loader(self.proc, self.seed)   # no-op for NullValidator
 
-        self.store = CheckpointStore(cfg.checkpoint_dir, cfg.checkpoint_every)
+        self.store = CheckpointStore(cfg.checkpoint_dir, cfg.checkpoint_every,
+                                     cfg.keep_checkpoints)
         self.stopper = EarlyStopping(cfg.monitor, cfg.monitor_mode,
                                      cfg.early_stopping_patience, cfg.min_delta)
         self.history = {"loss": [], "metrics": [], "epoch_time": [], "samples": [],
@@ -642,8 +671,8 @@ class Trainer:
         self.resumed_from = str(path)
         self._warn_config_drift(state)
         logger.info("resumed from {} | last epoch {} | best {}={} | continuing at epoch {}"
-                    " | no_improve={}", path, state["epoch"], cfg.monitor,
-                    self.stopper.best_score, self.start_epoch, self.stopper.no_improve)
+                    " | no_improve={}", path, state["epoch"] + 1, cfg.monitor,
+                    self.stopper.best_score, self.start_epoch + 1, self.stopper.no_improve)
         return True
 
     def _warn_config_drift(self, state):
@@ -744,14 +773,14 @@ class Trainer:
             self.history.setdefault("val", []).append(val)
 
         line = ("epoch {} | loss {:.4f} | {} | {} samples | {:.1f}s".format(
-            epoch, train["loss"],
+            epoch + 1, train["loss"],
             " | ".join(f"{k} {v:.4f}" for k, v in train["metrics"].items()),
             train["samples"], train["epoch_time"]))
         if val is not None:
             line += " || val " + " | ".join(f"{k} {v:.4f}" for k, v in val.items())
         logger.info(line)
 
-        self.tracker.log_epoch(epoch, train["metrics"], val, {
+        self.tracker.log_epoch(epoch + 1, train["metrics"], val, {
             "loss": train["loss"],
             "epoch_time": train["epoch_time"],
             "samples": float(train["samples"]),
@@ -765,8 +794,13 @@ class Trainer:
         payload = self._payload(epoch, train["metrics"], val, score)
 
         if self.store.due(epoch):
-            path = self.store.save(f"epoch_{epoch:03d}", payload)
+            # filename carries the same 1-based label as the logs and mlflow steps
+            path = self.store.save(f"epoch_{epoch + 1:03d}", payload)
             logger.info("checkpoint -> {}", path)
+            pruned = self.store.prune()
+            if pruned:
+                logger.info("pruned {} old checkpoint(s): {}", len(pruned),
+                            ", ".join(p.name for p in pruned))
 
         if self.stopper.update(score, epoch, mode=cfg.monitor_mode):
             self.history["best"] = {"epoch": epoch, "score": score, "monitor": cfg.monitor}
@@ -779,7 +813,7 @@ class Trainer:
         if self.stopper.should_stop:
             self.history["stopped_early"] = True
             logger.info("early stopping at epoch {} | best epoch {} ({}={:.4f})",
-                        epoch, self.stopper.best_epoch, cfg.monitor,
+                        epoch + 1, self.stopper.best_epoch + 1, cfg.monitor,
                         self.stopper.best_score)
             return True
         return False
@@ -798,9 +832,12 @@ class Trainer:
                 self.tracker.log_history(self.history, upto=self.start_epoch)
 
             if self.start_epoch >= cfg.num_epochs:
-                logger.info("nothing to train: start_epoch={} >= num_epochs={}",
-                            self.start_epoch, cfg.num_epochs)
+                logger.info("nothing to train: next epoch {} > num_epochs {}",
+                            self.start_epoch + 1, cfg.num_epochs)
 
+            # `epoch` is the internal 0-based index: it is the key into
+            # `history`, the checkpoint payload and the epoch_NNN.pt filename.
+            # Everything a human or the MLflow UI sees is rendered as epoch + 1.
             for epoch in range(self.start_epoch, cfg.num_epochs):
                 train = self.train_one_epoch(epoch)
                 val = self.validate()
@@ -845,13 +882,14 @@ class Trainer:
             self.model.eval()
             self.restored_best = True
             logger.info("restored best weights from {} (epoch {}, {}={:.4f})",
-                        self.store.best_path, state["epoch"], cfg.monitor, state["score"])
+                        self.store.best_path, state["epoch"] + 1, cfg.monitor, state["score"])
             self.tracker.log_state_dict(self.model, "model_best")
 
     def summary_tags(self):
         return {"effective_monitor": self.effective_monitor,
                 "validation": str(getattr(self.validation, "name", "custom")),
-                "best_epoch": str(self.stopper.best_epoch),
+                "best_epoch": str(self.stopper.best_epoch + 1
+                                  if self.stopper.best_epoch >= 0 else -1),
                 "stopped_early": str(self.history.get("stopped_early", False)),
                 "restored_best": str(self.restored_best),
                 "start_epoch": str(self.start_epoch),

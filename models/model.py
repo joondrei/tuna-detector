@@ -4,8 +4,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ["feature_extractor", "ResNet", "ResBlock", "IdentityPadding",
-           "ConvProjection", "AvgPoolPadding", "CustomResNet18", "build_model"]
+# __all__ = ["CustomResNet18", "build_model"]
 
 
 class feature_extractor(nn.Module):
@@ -174,6 +173,6 @@ class CustomResNet18(nn.Module):
         return out
 
 
-def build_model():
+def build_custom_resnet_model():
     """Default model factory (referenced by training_parameters / Trainer)."""
     return CustomResNet18(in_channels=1, n=7, res_option='A', use_dropout=False)

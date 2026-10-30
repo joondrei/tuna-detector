@@ -17,7 +17,7 @@ from torcheval.metrics import (BinaryAccuracy, BinaryAUROC, BinaryF1Score,
                                BinaryRecall)
 
 __all__ = ["fixed_rngs", "seed_worker", "make_metrics", "rng_generator",
-           "_resolve_device", "_sanitize", "_atomic_torch_save",
+           "prune_checkpoints", "_resolve_device", "_sanitize", "_atomic_torch_save",
            "_summary", "_flat_params", "_jsonable"]
 
 
@@ -70,6 +70,47 @@ def _atomic_torch_save(payload, path):
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, tmp)
     os.replace(tmp, path)
+
+
+def prune_checkpoints(directory, keep=5, prefix="epoch_"):
+    """Delete all but the `keep` most recent <<prefix>><number>.pt files.
+
+    Only files whose name is exactly the prefix plus an integer are considered,
+    so `best.pt`, `last.pt` and in-flight `*.tmp` files are never touched. The
+    newest file wins by the parsed number, not by name or mtime, so it stays
+    correct past 999 epochs (`epoch_1000.pt` sorts before `epoch_999.pt`
+    lexicographically but after it numerically).
+
+    `keep <= 0` (or None) disables pruning. Returns the deleted paths, oldest
+    first, so callers can log what went away.
+    """
+    directory = Path(directory)
+    if not keep or int(keep) <= 0 or not directory.is_dir():
+        return []
+    keep = int(keep)
+
+    numbered = []
+    for path in directory.iterdir():
+        if not path.is_file() or path.suffix != ".pt" or not path.name.startswith(prefix):
+            continue
+        try:
+            number = int(path.name[len(prefix):-len(".pt")])
+        except ValueError:
+            continue                      # e.g. epoch_backup.pt -> not ours
+        numbered.append((number, path))
+
+    if len(numbered) <= keep:
+        return []
+
+    numbered.sort(key=lambda item: item[0])     # ascending number == oldest first
+    removed = []
+    for _, path in numbered[:-keep]:
+        try:
+            path.unlink()
+            removed.append(path)
+        except OSError:
+            continue                      # already gone or locked; never break training
+    return removed
 
 
 # ------------------------------------------------------------------ metrics

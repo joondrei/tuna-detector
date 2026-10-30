@@ -237,7 +237,7 @@ class MlflowTracker(NullTracker):
 
     def __init__(self, tracking_uri=None, experiment=None, run_name=None,
                  log_params=True, log_state_dict=True, log_checkpoints=True,
-                 log_history=True):
+                 log_history=True, log_system=True, async_logging=True):
         self.tracking_uri = tracking_uri
         self.experiment = experiment
         self.default_run_name = run_name
@@ -245,6 +245,8 @@ class MlflowTracker(NullTracker):
         self._log_state_dict = log_state_dict
         self._log_checkpoints = log_checkpoints
         self._log_history = log_history
+        self._log_system = log_system
+        self._async_logging = async_logging
         self._run = None
         self.run_id = None
 
@@ -256,6 +258,12 @@ class MlflowTracker(NullTracker):
         if self.tracking_uri:
             mlflow.set_tracking_uri(self.tracking_uri)
             logger.debug(f"MLflow tracking URI set to: {mlflow.get_tracking_uri()}")
+        if self._async_logging:
+            mlflow.config.enable_async_logging(True)
+            logger.debug(f"MLflow is set to asynchronously log.")
+        if self._log_system:
+            mlflow.enable_system_metrics_logging()
+            logger.debug(f"MLflow is tracking system metrics.")
         if self.experiment:
             if mlflow.get_tracking_uri() == "databricks":
                 w = WorkspaceClient()
@@ -322,6 +330,10 @@ class MlflowTracker(NullTracker):
                                    step=e + 1)
             if e < len(history.get("epoch_time") or []):
                 mlflow.log_metric("epoch_time", float(history["epoch_time"][e]), step=e + 1)
+            if e < len(history.get("epoch_prep_time") or []):
+                mlflow.log_metric("epoch_prep_time", float(history["epoch_prep_time"][e]), step=e + 1)
+            if e < len(history.get("epoch_train_time") or []):
+                mlflow.log_metric("epoch_train_time", float(history["epoch_train_time"][e]), step=e + 1)
             if e < len(history.get("samples") or []):
                 mlflow.log_metric("samples", float(history["samples"][e]), step=e + 1)
         if upto:
@@ -631,8 +643,8 @@ class Trainer:
                                      cfg.keep_checkpoints)
         self.stopper = EarlyStopping(cfg.monitor, cfg.monitor_mode,
                                      cfg.early_stopping_patience, cfg.min_delta)
-        self.history = {"loss": [], "metrics": [], "epoch_time": [], "samples": [],
-                        "best": {}, "stopped_early": False}
+        self.history = {"loss": [], "metrics": [], "epoch_time": [], "epoch_train_time": [], "epoch_prep_time": [],
+                         "samples": [], "best": {}, "stopped_early": False}
         return self
 
     def _make_loader(self, dataset):
@@ -702,9 +714,14 @@ class Trainer:
 
         running_loss, seen = 0.0, 0
         started = time.perf_counter()
+        epoch_prep_time = 0.0
+        epoch_train_time = 0.0
 
+        prep_start_time = time.perf_counter()
         for step, batch in enumerate(self.dataloader):
-            step_start = time.perf_counter()
+            prep_time = time.perf_counter() - prep_start_time
+            epoch_prep_time += prep_time
+            train_start_time = time.perf_counter()
             inputs, labels = move_batch(batch, self.device)
 
             loss, probs = train_step(self.model, self.criterion, self.optimizer,
@@ -716,12 +733,16 @@ class Trainer:
             running_loss += loss.item() * n
             seen += n
 
+            train_time = time.perf_counter() - train_start_time
+            epoch_train_time += train_time
+
             if cfg.log_every and step % cfg.log_every == 0:
                 self.tracker.log_step(self.global_step, loss.item())
-                logger.info("step {:4d} | loss {:.4f} | acc {:.4f} | auroc {:.4f} | {:.2f}s",
+                logger.info("step {:4d} | loss {:.4f} | acc {:.4f} | auroc {:.4f} | {:.2f}s prep time | {:.2f}s train time",
                             step, loss.item(), metrics["accuracy"].compute().item(),
-                            metrics["auroc"].compute().item(),
-                            time.perf_counter() - step_start)
+                            metrics["auroc"].compute().item(), prep_time, train_time)
+
+            prep_start_time = time.perf_counter()
 
             if cfg.steps_per_epoch is not None and (step + 1) >= cfg.steps_per_epoch:
                 break
@@ -732,7 +753,10 @@ class Trainer:
         return {"loss": running_loss / seen,
                 "metrics": {k: m.compute().item() for k, m in metrics.items()},
                 "samples": seen,
-                "epoch_time": time.perf_counter() - started}
+                "epoch_time": time.perf_counter() - started,
+                "epoch_prep_time": epoch_prep_time,
+                "epoch_train_time": epoch_train_time
+                }
 
     def validate(self):
         """Delegate to the validator; NullValidator returns None (no-op)."""
@@ -768,14 +792,19 @@ class Trainer:
         self.history["loss"].append(train["loss"])
         self.history["metrics"].append(train["metrics"])
         self.history["epoch_time"].append(train["epoch_time"])
+        self.history["epoch_prep_time"].append(train["epoch_prep_time"])
+        self.history["epoch_train_time"].append(train["epoch_train_time"])
         self.history["samples"].append(train["samples"])
+
+
         if val is not None:                   # keep the val series aligned with epochs
             self.history.setdefault("val", []).append(val)
 
         line = ("epoch {} | loss {:.4f} | {} | {} samples | {:.1f}s".format(
             epoch + 1, train["loss"],
             " | ".join(f"{k} {v:.4f}" for k, v in train["metrics"].items()),
-            train["samples"], train["epoch_time"]))
+            train["samples"], train["epoch_time"], train["epoch_prep_time"],
+            train["epoch_train_time"]))
         if val is not None:
             line += " || val " + " | ".join(f"{k} {v:.4f}" for k, v in val.items())
         logger.info(line)
@@ -783,6 +812,8 @@ class Trainer:
         self.tracker.log_epoch(epoch + 1, train["metrics"], val, {
             "loss": train["loss"],
             "epoch_time": train["epoch_time"],
+            "epoch_prep_time": train["epoch_prep_time"],
+            "epoch_train_time": train["epoch_train_time"],
             "samples": float(train["samples"]),
             "lr": self.optimizer.param_groups[0]["lr"],
             "global_step": float(self.global_step),

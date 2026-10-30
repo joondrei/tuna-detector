@@ -99,7 +99,9 @@ def main() -> int:
         log_params=True,
         log_state_dict=True,
         log_checkpoints=True,
-        log_history=True
+        log_history=True,
+        log_system=True,
+        async_logging=True,
     )
 
     trainer = Trainer(

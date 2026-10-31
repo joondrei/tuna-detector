@@ -777,6 +777,7 @@ class Trainer:
             "global_step": self.global_step,
             "score": score,
             "monitor": self.cfg.monitor,
+            "effective_monitor": self.effective_monitor,
             "best_score": self.stopper.best_score,
             "best_epoch": self.stopper.best_epoch,
             "no_improve": self.stopper.no_improve,
@@ -825,9 +826,14 @@ class Trainer:
         })
 
     @timeit
-    def _checkpoint(self, epoch, train, val, score):
-        """Checkpoint + best model + early stopping. Returns True to stop."""
+    def _checkpoint(self, epoch, train, val, score, mode=None):
+        """Checkpoint + best model + early stopping. Returns True to stop.
+
+        `mode` is the direction of `score`: it defaults to `monitor_mode`, but `fit()`
+        passes "min" when the monitored key was missing and the score is a train loss.
+        """
         cfg = self.cfg
+        mode = mode or cfg.monitor_mode
         payload = self._payload(epoch, train["metrics"], val, score)
 
         if self.store.due(epoch):
@@ -839,10 +845,11 @@ class Trainer:
                 logger.info("pruned {} old checkpoint(s): {}", len(pruned),
                             ", ".join(p.name for p in pruned))
 
-        if self.stopper.update(score, epoch, mode=cfg.monitor_mode):
-            self.history["best"] = {"epoch": epoch, "score": score, "monitor": cfg.monitor}
+        if self.stopper.update(score, epoch, mode=mode):
+            self.history["best"] = {"epoch": epoch, "score": score,
+                                    "monitor": self.effective_monitor}
             path = self.store.save("best", payload)
-            logger.info("best model -> {}  ({}={:.4f})", path, cfg.monitor, score)
+            logger.info("best model -> {}  ({}={:.4f})", path, self.effective_monitor, score)
         elif self.stopper.patience:
             logger.info("no improvement for {}/{} epoch(s)",
                         self.stopper.no_improve, self.stopper.patience)
@@ -850,7 +857,7 @@ class Trainer:
         if self.stopper.should_stop:
             self.history["stopped_early"] = True
             logger.info("early stopping at epoch {} | best epoch {} ({}={:.4f})",
-                        epoch + 1, self.stopper.best_epoch + 1, cfg.monitor,
+                        epoch + 1, self.stopper.best_epoch + 1, self.effective_monitor,
                         self.stopper.best_score)
             return True
         return False
@@ -884,17 +891,23 @@ class Trainer:
 
                 score, used_val = self.score(train["loss"], val)
                 self.effective_monitor = cfg.monitor if used_val else "loss"
+                # a fallback score is a train loss, so it must be minimised whatever
+                # monitor_mode says for the (missing) monitored metric
+                effective_mode = cfg.monitor_mode if used_val else "min"
                 if val is not None and not used_val:
-                    logger.warning("monitor '{}' not in val={}; falling back to train loss",
-                                   cfg.monitor, sorted(val))
+                    logger.warning("monitor '{}' not in val={}; falling back to train loss "
+                                   "({} mode)", cfg.monitor, sorted(val), effective_mode)
 
                 self.last = dict(epoch=epoch, metrics=train["metrics"],
                                  val=val, score=score)
 
-                if self._checkpoint(epoch, train, val, score):
+                if self._checkpoint(epoch, train, val, score, mode=effective_mode):
                     break
 
             self._finalize()
+            if self.stopper.best_score is None:
+                logger.warning("no epoch was trained (start_epoch={}, num_epochs={}); "
+                               "best_score is None", self.start_epoch, cfg.num_epochs)
             self.tracker.log_summary(self.summary_tags(), self.summary_metrics())
         except BaseException:
             self.tracker.end("FAILED")
@@ -921,7 +934,8 @@ class Trainer:
             self.model.eval()
             self.restored_best = True
             logger.info("restored best weights from {} (epoch {}, {}={:.4f})",
-                        self.store.best_path, state["epoch"] + 1, cfg.monitor, state["score"])
+                        self.store.best_path, state["epoch"] + 1,
+                        state.get("effective_monitor", cfg.monitor), state["score"])
             self.tracker.log_state_dict(self.model, "model_best")
 
     def summary_tags(self):

@@ -37,6 +37,7 @@ processing_parameters = {
     "patch_size": 32,
     "patch_tc_dim": 16,
     "pad_with": "min_rank",            # min_rank | max_rank: patch repeated in a short mosaic
+    "ignore_patch_overlap": False,     # True: poor/rich may pick the same patches
     "texture_filter": DEFAULT_TEXTURE_FILTER,
     "fft_filter_size": 30,
     "freq_patch_scaling_func": "minmax_patches",

@@ -57,7 +57,7 @@ class ProcessingConfig:
                  patch_size=32, patch_tc_dim=16, texture_filter=None, fft_filter_size=30,
                  freq_patch_scaling_func="minmax_patches",
                  spatial_patch_scaling_func="minmax_patches", spatial_filters=None,
-                 shuffle=False, pad_with="min_rank"):
+                 shuffle=False, pad_with="min_rank", ignore_patch_overlap=False):
         self.filepattern = filepattern
         self.features = list(features or ["prepatch"])
         self.colorspace = colorspace
@@ -75,6 +75,7 @@ class ProcessingConfig:
         self.spatial_filters = default_spatial_filters() if spatial_filters is None else spatial_filters
         self.shuffle = bool(shuffle)
         self.pad_with = pad_with
+        self.ignore_patch_overlap = ignore_patch_overlap
         self.validate()
 
     # -- validation --------------------------------------------------------
@@ -92,6 +93,9 @@ class ProcessingConfig:
         if self.pad_with not in PAD_CHOICES:
             raise ValueError(f"pad_with must be one of {list(PAD_CHOICES)}, "
                              f"got {self.pad_with!r}")
+        if not isinstance(self.ignore_patch_overlap, bool):
+            raise ValueError(f"ignore_patch_overlap must be a bool, "
+                             f"got {self.ignore_patch_overlap!r}")
         return self
 
     # -- derived -----------------------------------------------------------
@@ -130,7 +134,8 @@ class ProcessingConfig:
                 "spatial_patch_scaling_func": self.spatial_patch_scaling_func,
                 "spatial_filters": self.spatial_filters,
                 "shuffle": self.shuffle,
-                "pad_with": self.pad_with}
+                "pad_with": self.pad_with,
+                "ignore_patch_overlap": self.ignore_patch_overlap}
 
 
 # ------------------------------------------------------------- colour space
@@ -289,28 +294,35 @@ Scalers._registry.update({"minmax_patches": Scalers.minmax_patches,
 class PatchRanker:
     """Selects the N least and N most textured patches of a patch stack."""
 
-    def __init__(self, n_patches=64, tc_dim=16, scorer=None, pad_with="min_rank"):
+    def __init__(self, n_patches=64, tc_dim=16, scorer=None, pad_with="min_rank",
+                 ignore_patch_overlap=False):
         if pad_with not in PAD_CHOICES:
             raise ValueError(f"pad_with must be one of {list(PAD_CHOICES)}, got {pad_with!r}")
+        if not isinstance(ignore_patch_overlap, bool):
+            raise ValueError(f"ignore_patch_overlap must be a bool, "
+                             f"got {ignore_patch_overlap!r}")
         self.n_patches = int(n_patches)
         self.tc_dim = int(tc_dim)
         self.scorer = scorer or TextureComplexityScorer()
         self.pad_with = pad_with
+        self.ignore_patch_overlap = ignore_patch_overlap
 
     def __call__(self, patches, image_filter=None):
         """N least / N most textured patches, topped up by repeating a real patch.
 
-        With fewer than 2 * n_patches patches the two mosaics cannot get disjoint
-        sets, so the stack is split evenly (least half / most half) and each half is
-        filled up to n_patches with copies of one of its own patches, chosen by
-        `pad_with`: "min_rank" repeats the least textured patch of that mosaic,
-        "max_rank" the most textured one.
+        `ignore_patch_overlap=False` (default) keeps the two mosaics disjoint: the
+        stack is split evenly (least half / most half), so with fewer than
+        2 * n_patches patches each mosaic gets k // 2 real patches.
 
-        Returning fewer patches, or padding with zeros, is not an option: a zero
-        patch scores the maximum in `TextureComplexityScorer` (1.0) and, once the
-        stack is padded to exactly n_patches, `order[:n]` and `order[-n:]` become
-        the same permutation - both mosaics would come out identical and the
-        rich-poor contrast would vanish.
+        `ignore_patch_overlap=True` lets both mosaics draw on the whole stack - the
+        N least and the N most may contain the same patches. They overlap when
+        k < 2 * n_patches, and for k <= n_patches the two selections are the *same*
+        set, so both mosaics come out identical.
+
+        Either way, a mosaic with fewer than n_patches real patches is filled up to
+        n_patches with copies of one of its own patches, chosen by `pad_with`:
+        "min_rank" repeats the least textured patch of that mosaic, "max_rank" the
+        most textured one.
         """
         if patches.shape[0] < 1:
             raise ValueError("cannot rank an empty patch stack")
@@ -319,11 +331,19 @@ class PatchRanker:
         scores = self.scorer(residuals, self.tc_dim).flatten(1).sum(dim=1)
 
         _, order = scores.sort()
-        take = min(self.n_patches, max(1, patches.shape[0] // 2))
+        available = int(patches.shape[0])
+        if self.ignore_patch_overlap:
+            take = min(self.n_patches, available)
+        else:
+            take = min(self.n_patches, max(1, available // 2))
+
         if take < self.n_patches:
-            logger.warning("only {} patch(es) for {} wanted: ranking the {} least and {} "
-                           "most, repeating each mosaic's {} patch to fill it",
-                           patches.shape[0], self.n_patches * 2, take, take, self.pad_with)
+            logger.warning("only {} patch(es) available for {} wanted{}: repeating each "
+                           "mosaic's {} patch {} time(s) to fill it",
+                           available, self.n_patches,
+                           "" if self.ignore_patch_overlap
+                           else " (disjoint halves, so half of that per mosaic)",
+                           self.pad_with, self.n_patches - take)
         return self._pad_to_n(patches[order[:take]]), self._pad_to_n(patches[order[-take:]])
 
     def _pad_to_n(self, selected):
@@ -394,7 +414,8 @@ class FeatureBuilder:
         self.filters = filters or FilterBank(config.spatial_filters, config.fft_filter_size)
         self.scorer = scorer or TextureComplexityScorer()
         self.ranker = ranker or PatchRanker(config.n_patches, config.patch_tc_dim,
-                                            self.scorer, config.pad_with)
+                                            self.scorer, config.pad_with,
+                                            config.ignore_patch_overlap)
         self.assembler = assembler or MosaicAssembler(config.n_patches)
         self.patches = patches or PatchExtractor(config.patch_size)
         self.augmenter = augmenter
@@ -520,13 +541,14 @@ class FeatureDataset(IterableDataset):
                  patch_size=32, patch_tc_dim=16, texture_filter=None, fft_filter_size=30,
                  freq_patch_scaling_func="minmax_patches",
                  spatial_patch_scaling_func="minmax_patches", spatial_filters=None,
-                 pad_with="min_rank", seed=42, shuffle=False, source=None, builder=None):
+                 pad_with="min_rank", ignore_patch_overlap=False, seed=42, shuffle=False,
+                 source=None, builder=None):
 
         self.cfg = ProcessingConfig(filepattern, features, colorspace, labeltype, augment,
                                     resize_img, img_size, n_patches, patch_size, patch_tc_dim,
                                     texture_filter, fft_filter_size, freq_patch_scaling_func,
                                     spatial_patch_scaling_func, spatial_filters, shuffle,
-                                    pad_with)
+                                    pad_with, ignore_patch_overlap)
         self.seed = int(seed)
         self.epoch = 0
         self.source = source or ParquetImageSource(filepattern, labeltype=labeltype,

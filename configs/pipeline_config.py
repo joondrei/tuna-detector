@@ -36,6 +36,7 @@ processing_parameters = {
     "n_patches": 64,
     "patch_size": 32,
     "patch_tc_dim": 16,
+    "pad_with": "min_rank",            # min_rank | max_rank: patch repeated in a short mosaic
     "texture_filter": DEFAULT_TEXTURE_FILTER,
     "fft_filter_size": 30,
     "freq_patch_scaling_func": "minmax_patches",

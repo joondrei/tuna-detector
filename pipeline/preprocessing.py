@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 import pyarrow.parquet as pq
 from PIL import Image
+from loguru import logger
 
 from torchvision.transforms.functional import center_crop, to_tensor, resize
 import torchvision.transforms as transforms
@@ -38,6 +39,11 @@ from configs.filters import (DEFAULT_TEXTURE_FILTER, SPATIAL_FILTERS,
 
 
 FEATURE_NAMES = ("residuals", "tc", "prepatch", "poor", "rich", "fft_poor", "fft_rich")
+
+# Which patch of a mosaic is repeated when an image yields fewer than 2 * n_patches
+# patches: the least textured (min_rank) or the most textured (max_rank) of the
+# patches already selected for that mosaic.
+PAD_CHOICES = ("min_rank", "max_rank")
 
 # ------------------------------------------------------------------ config
 class ProcessingConfig:
@@ -51,7 +57,7 @@ class ProcessingConfig:
                  patch_size=32, patch_tc_dim=16, texture_filter=None, fft_filter_size=30,
                  freq_patch_scaling_func="minmax_patches",
                  spatial_patch_scaling_func="minmax_patches", spatial_filters=None,
-                 shuffle=False):
+                 shuffle=False, pad_with="min_rank"):
         self.filepattern = filepattern
         self.features = list(features or ["prepatch"])
         self.colorspace = colorspace
@@ -68,6 +74,7 @@ class ProcessingConfig:
         self.spatial_patch_scaling_func = spatial_patch_scaling_func
         self.spatial_filters = default_spatial_filters() if spatial_filters is None else spatial_filters
         self.shuffle = bool(shuffle)
+        self.pad_with = pad_with
         self.validate()
 
     # -- validation --------------------------------------------------------
@@ -82,6 +89,9 @@ class ProcessingConfig:
             raise ValueError(f"n_patches must be a perfect square, got {self.n_patches}")
         if self.patch_size < 1 or self.img_size < 1:
             raise ValueError("img_size and patch_size must be positive")
+        if self.pad_with not in PAD_CHOICES:
+            raise ValueError(f"pad_with must be one of {list(PAD_CHOICES)}, "
+                             f"got {self.pad_with!r}")
         return self
 
     # -- derived -----------------------------------------------------------
@@ -119,7 +129,8 @@ class ProcessingConfig:
                 "freq_patch_scaling_func": self.freq_patch_scaling_func,
                 "spatial_patch_scaling_func": self.spatial_patch_scaling_func,
                 "spatial_filters": self.spatial_filters,
-                "shuffle": self.shuffle}
+                "shuffle": self.shuffle,
+                "pad_with": self.pad_with}
 
 
 # ------------------------------------------------------------- colour space
@@ -278,20 +289,54 @@ Scalers._registry.update({"minmax_patches": Scalers.minmax_patches,
 class PatchRanker:
     """Selects the N least and N most textured patches of a patch stack."""
 
-    def __init__(self, n_patches=64, tc_dim=16, scorer=None):
+    def __init__(self, n_patches=64, tc_dim=16, scorer=None, pad_with="min_rank"):
+        if pad_with not in PAD_CHOICES:
+            raise ValueError(f"pad_with must be one of {list(PAD_CHOICES)}, got {pad_with!r}")
         self.n_patches = int(n_patches)
         self.tc_dim = int(tc_dim)
         self.scorer = scorer or TextureComplexityScorer()
+        self.pad_with = pad_with
 
     def __call__(self, patches, image_filter=None):
-        if patches.shape[0] < self.n_patches:
-            raise ValueError(f"insufficient patches: need {self.n_patches}, "
-                             f"have {patches.shape[0]}")
+        """N least / N most textured patches, topped up by repeating a real patch.
+
+        With fewer than 2 * n_patches patches the two mosaics cannot get disjoint
+        sets, so the stack is split evenly (least half / most half) and each half is
+        filled up to n_patches with copies of one of its own patches, chosen by
+        `pad_with`: "min_rank" repeats the least textured patch of that mosaic,
+        "max_rank" the most textured one.
+
+        Returning fewer patches, or padding with zeros, is not an option: a zero
+        patch scores the maximum in `TextureComplexityScorer` (1.0) and, once the
+        stack is padded to exactly n_patches, `order[:n]` and `order[-n:]` become
+        the same permutation - both mosaics would come out identical and the
+        rich-poor contrast would vanish.
+        """
+        if patches.shape[0] < 1:
+            raise ValueError("cannot rank an empty patch stack")
+
         residuals = patches if image_filter is None else FilterBank.apply(patches, image_filter)
         scores = self.scorer(residuals, self.tc_dim).flatten(1).sum(dim=1)
 
         _, order = scores.sort()
-        return patches[order[:self.n_patches]], patches[order[-self.n_patches:]]
+        take = min(self.n_patches, max(1, patches.shape[0] // 2))
+        if take < self.n_patches:
+            logger.warning("only {} patch(es) for {} wanted: ranking the {} least and {} "
+                           "most, repeating each mosaic's {} patch to fill it",
+                           patches.shape[0], self.n_patches * 2, take, take, self.pad_with)
+        return self._pad_to_n(patches[order[:take]]), self._pad_to_n(patches[order[-take:]])
+
+    def _pad_to_n(self, selected):
+        """Fill `selected` up to n_patches with copies of its min- or max-ranked patch.
+
+        `selected` is sorted ascending by texture complexity, so its first patch is
+        the min_rank one and its last patch the max_rank one.
+        """
+        missing = self.n_patches - selected.shape[0]
+        if missing <= 0:
+            return selected
+        source = selected[-1:] if self.pad_with == "max_rank" else selected[:1]
+        return torch.cat((selected, source.expand(missing, *selected.shape[1:])), dim=0)
 
 
 class MosaicAssembler:
@@ -348,7 +393,8 @@ class FeatureBuilder:
         self.converter = converter or ColorSpaceConverter(config.colorspace)
         self.filters = filters or FilterBank(config.spatial_filters, config.fft_filter_size)
         self.scorer = scorer or TextureComplexityScorer()
-        self.ranker = ranker or PatchRanker(config.n_patches, config.patch_tc_dim, self.scorer)
+        self.ranker = ranker or PatchRanker(config.n_patches, config.patch_tc_dim,
+                                            self.scorer, config.pad_with)
         self.assembler = assembler or MosaicAssembler(config.n_patches)
         self.patches = patches or PatchExtractor(config.patch_size)
         self.augmenter = augmenter
@@ -474,12 +520,13 @@ class FeatureDataset(IterableDataset):
                  patch_size=32, patch_tc_dim=16, texture_filter=None, fft_filter_size=30,
                  freq_patch_scaling_func="minmax_patches",
                  spatial_patch_scaling_func="minmax_patches", spatial_filters=None,
-                 seed=42, shuffle=False, source=None, builder=None):
+                 pad_with="min_rank", seed=42, shuffle=False, source=None, builder=None):
 
         self.cfg = ProcessingConfig(filepattern, features, colorspace, labeltype, augment,
                                     resize_img, img_size, n_patches, patch_size, patch_tc_dim,
                                     texture_filter, fft_filter_size, freq_patch_scaling_func,
-                                    spatial_patch_scaling_func, spatial_filters, shuffle)
+                                    spatial_patch_scaling_func, spatial_filters, shuffle,
+                                    pad_with)
         self.seed = int(seed)
         self.epoch = 0
         self.source = source or ParquetImageSource(filepattern, labeltype=labeltype,

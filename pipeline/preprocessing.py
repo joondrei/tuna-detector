@@ -306,6 +306,7 @@ class PatchRanker:
         self.scorer = scorer or TextureComplexityScorer()
         self.pad_with = pad_with
         self.ignore_patch_overlap = ignore_patch_overlap
+        self.padded = 0          # ranker calls that needed a repeated patch (one per path)
 
     def __call__(self, patches, image_filter=None):
         """N least / N most textured patches, topped up by repeating a real patch.
@@ -338,12 +339,17 @@ class PatchRanker:
             take = min(self.n_patches, max(1, available // 2))
 
         if take < self.n_patches:
-            logger.warning("only {} patch(es) available for {} wanted{}: repeating each "
-                           "mosaic's {} patch {} time(s) to fill it",
-                           available, self.n_patches,
-                           "" if self.ignore_patch_overlap
-                           else " (disjoint halves, so half of that per mosaic)",
-                           self.pad_with, self.n_patches - take)
+            self.padded += 1
+            needed = self.n_patches if self.ignore_patch_overlap else 2 * self.n_patches
+            if self.padded == 1:         # once is enough: this is a property of the data
+                logger.warning(
+                    "patch stack too small: {} patch(es) for {} per mosaic (need {}) - "
+                    "filling each mosaic with copies of its {} patch; further occurrences "
+                    "are only counted (PatchRanker.padded)",
+                    available, self.n_patches, needed, self.pad_with)
+            else:
+                logger.trace("patch stack too small: {} for {} per mosaic",
+                             available, self.n_patches)
         return self._pad_to_n(patches[order[:take]]), self._pad_to_n(patches[order[-take:]])
 
     def _pad_to_n(self, selected):

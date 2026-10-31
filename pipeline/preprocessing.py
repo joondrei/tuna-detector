@@ -20,13 +20,45 @@
 # for `DatasetPreprocessing` (same kwargs, same yielded dict), and every part is
 # injectable, so it also works as `Trainer(..., dataset_factory=FeatureDataset)`.
 # =============================================================================
+
+# -------------------------------------------------------------------- usage
+# from configs.pipeline_config import processing_parameters, SEED
+# from pipeline.preprocessing import FeatureDataset
+#
+# dataset = FeatureDataset(**processing_parameters, seed=SEED)      # drop-in
+#
+# pieces are usable on their own (no parquet, no workers):
+# from pipeline.preprocessing import FeatureBuilder, ProcessingConfig
+# builder = FeatureBuilder.from_config(ProcessingConfig(
+#     "unused", features=["fft_poor", "fft_rich"], colorspace="Y"))
+
+# ------------------------------------------------------------- cached usage
+# from pipeline.utils import build_cache
+# from pipeline.preprocessing import FeatureDataset, CachedFeatureDataset
+#
+# build_cache("cache/train", processing_parameters, FeatureDataset, overwrite=True)
+#
+# dataset = CachedFeatureDataset("cache/train", **processing_parameters)
+# loader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=8,
+#                     persistent_workers=True, pin_memory=True)
+#
+# # Trainer(processing_parameters, build_custom_resnet_model, training_parameters,
+# #         dataset_factory=CachedFeatureDataset.factory("cache/train"))
+#
+# The cache is only valid for the exact processing_parameters it was built with: a
+# differing feature list, colorspace, img_size, patch_size or n_patches is refused at
+# load time instead of being decoded into silently wrong tensors.
+
 import glob
 import io
 import math
+import json
+from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, Dataset
 import pyarrow.parquet as pq
 from PIL import Image
 
@@ -43,6 +75,7 @@ FEATURE_NAMES = ("residuals", "tc", "prepatch", "poor", "rich", "fft_poor", "fft
 # patches: the least textured (min_rank) or the most textured (max_rank) of the
 # patches already selected for that mosaic.
 PAD_CHOICES = ("min_rank", "max_rank")
+
 
 # ------------------------------------------------------------------ config
 class ProcessingConfig:
@@ -559,14 +592,150 @@ class FeatureDataset(IterableDataset):
         for image, label in self.source(files):
             yield {"features": self.builder(image), "label": label}
 
+class CachedFeatureDataset(Dataset):
+    """Map-style reader for a directory written by `pipeline.utils.build_cache()`.
 
-# -------------------------------------------------------------------- usage
-# from configs.pipeline_config import processing_parameters, SEED
-# from pipeline.preprocessing import FeatureDataset
-#
-# dataset = FeatureDataset(**processing_parameters, seed=SEED)      # drop-in
-#
-# pieces are usable on their own (no parquet, no workers):
-# from pipeline.preprocessing import FeatureBuilder, ProcessingConfig
-# builder = FeatureBuilder.from_config(ProcessingConfig(
-#     "unused", features=["fft_poor", "fft_rich"], colorspace="Y"))
+        dataset = CachedFeatureDataset("cache/train")
+        loader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=8,
+                            persistent_workers=True, prefetch_factor=8, pin_memory=True)
+    """
+
+    @staticmethod
+    def feature_order(features):
+        if features is None:
+            return None
+        if isinstance(features, str):
+            return [features]
+        return [str(name) for name in features]
+
+    def __init__(self, cache_dir, features=None, colorspace=None, labeltype=None,
+                 img_size=None, patch_size=None, n_patches=None, pad_with=None,
+                 ignore_patch_overlap=None, seed=42, **unused):
+        self.cache_dir = Path(cache_dir)
+        meta_path = self.cache_dir / "meta.json"
+        if not meta_path.is_file():
+            raise FileNotFoundError(
+                f"{self.cache_dir} is not a complete cache (no meta.json); build it "
+                f"with pipeline.utils.build_cache(...)")
+
+        self.meta = json.loads(meta_path.read_text())
+
+        self.features = self.meta["features"]         # name -> shape/dtype/offset/nbytes
+        self.feature_names = list(self.meta["feature_order"])   # record packing order
+        self.n_samples = int(self.meta["n_samples"])
+        self.record_bytes = int(self.meta["record_bytes"])
+        self.fingerprint = self.meta.get("fingerprint")
+        self.seed = int(seed)
+        self.epoch = 0
+        self._mm = None
+        self._labels = None
+
+        # refusals that would otherwise train on silently wrong features
+        if features is not None:
+            given = self.feature_order(features)
+            if given != self.feature_names:
+                raise ValueError(f"cache {self.cache_dir} holds {self.feature_names}, "
+                                 f"not {given}; rebuild the cache")
+        for name, given in (("colorspace", colorspace), ("labeltype", labeltype),
+                            ("img_size", img_size), ("patch_size", patch_size),
+                            ("n_patches", n_patches), ("pad_with", pad_with),
+                            ("ignore_patch_overlap", ignore_patch_overlap)):
+            cached = self.meta["config"].get(name)
+            if cached is None:
+                if given is not None:
+                    print(f"[cache] {self.cache_dir} predates '{name}' "
+                          f"(meta.json has no value); using {name}={given!r}")
+                continue
+            if given is not None and given != cached:
+                raise ValueError(f"cache {self.cache_dir} was built with {name}={cached!r}, "
+                                 f"got {name}={given!r}; rebuild the cache")
+        if unused.get("augment"):
+            print(f"[cache] ignoring augment=True: {self.cache_dir} is pre-augmented "
+                  f"(none); augment the decoded tensors instead")
+
+        samples_path = self.cache_dir / "samples.bin"
+        expected = self.n_samples * self.record_bytes
+        if samples_path.stat().st_size != expected:
+            raise RuntimeError(f"{samples_path} is {samples_path.stat().st_size} bytes, "
+                               f"expected {expected} ({self.n_samples} x "
+                               f"{self.record_bytes}); cache truncated?")
+
+    # -- Trainer adapter ---------------------------------------------------
+    @classmethod
+    def factory(cls, cache_dir, **defaults):
+        """`dataset_factory` adapter: absorbs the processing kwargs Trainer passes.
+
+            Trainer(processing_parameters, model, training_parameters,
+                    dataset_factory=CachedFeatureDataset.factory("cache/train"))
+        """
+        return lambda **kwargs: cls(cache_dir, **{**defaults, **kwargs})
+
+    @staticmethod
+    def _np_dtype(name):
+        np_names = {"float32": np.float32, "float16": np.float16}
+        try:
+            return np_names[name]
+        except KeyError:
+            raise ValueError(f"cache stores unsupported dtype {name!r}") from None
+
+    def __len__(self):
+        return self.n_samples
+
+    @property
+    def labels(self):
+        """int64 labels in cache order, for split and class-balance checks."""
+        if self._labels is None:
+            self._labels = np.load(self.cache_dir / "labels.npy", mmap_mode="r")
+        return self._labels
+
+    def set_epoch(self, epoch):
+        """No-op (Trainer compatibility): the loader's sampler does the shuffling."""
+        self.epoch = int(epoch)
+
+    def _samples(self):
+        if self._mm is None:
+            self._mm = np.memmap(self.cache_dir / "samples.bin", dtype=np.uint8,
+                                 mode="r", shape=(self.n_samples, self.record_bytes))
+        return self._mm
+
+    def _decode(self, record, name):
+        spec = self.features[name]
+        start = spec["offset"]
+        chunk = record[start:start + spec["nbytes"]]
+        array = np.frombuffer(chunk, dtype=self._np_dtype(spec["dtype"]))
+        array = array.reshape(spec["shape"]).astype(np.float32)   # copy: leaves mmap alone
+        if spec["dtype"] == "uint8":
+            array /= 255.0
+        return torch.from_numpy(array)
+
+    def __getitem__(self, index):
+        if index < 0:
+            index += self.n_samples
+        if not 0 <= index < self.n_samples:
+            raise IndexError(f"index {index} out of range for {self.n_samples} cached samples")
+        record = self._samples()[index]
+        features = {name: self._decode(record, name) for name in self.feature_names}
+        return {"features": features,
+                "label": torch.tensor(int(self.labels[index]), dtype=torch.long)}
+
+    # -- pickling ----------------------------------------------------------
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_mm"] = None              # both are reopened lazily in each worker
+        state["_labels"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._mm = None
+        self._labels = None
+
+    def __repr__(self):
+        dtypes = ", ".join(f"{n}:{s['dtype']}" for n, s in self.features.items())
+        return (f"CachedFeatureDataset({str(self.cache_dir)!r}, "
+                f"n_samples={self.n_samples}, "
+                f"record={self.record_bytes / 2 ** 10:.0f}KiB, {dtypes})")
+
+
+
+

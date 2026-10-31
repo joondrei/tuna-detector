@@ -10,11 +10,17 @@ identical to the notebook version.
 import os
 import random
 from pathlib import Path
+import hashlib
+import json
+from datetime import datetime, timezone
+
 
 import numpy as np
 import torch
 from torcheval.metrics import (BinaryAccuracy, BinaryAUROC, BinaryF1Score,
                                BinaryRecall)
+from torch.utils.data import DataLoader
+
 from loguru import logger
 from collections.abc import Callable
 import time
@@ -203,3 +209,158 @@ def timeit(func: Callable[P, R]) -> Callable[P, R]:
         return result
 
     return timeit_wrapper
+
+
+def build_cache(cache_dir, processing_params, processor, dtype=torch.float32,
+                overwrite=False, log_every=250):
+    """Write a fixed-size-record binary cache from a DataLoader over processor(**processing_params).
+
+    `dtype` must be torch.float32 or torch.float16.
+    """
+    if dtype is torch.uint8:
+        raise ValueError(
+            "dtype=torch.uint8 is not supported: casting normalised features in [0, 1] "
+
+    def _iter_samples(loader):
+        """Yield ({name: tensor}, label) one sample at a time from collated batches."""
+        for batch in loader:
+            if isinstance(batch, dict):
+                missing = {"features", "label"} - batch.keys()
+                if missing:
+                    raise TypeError(f"expected a batch dict with 'features' and 'label', "
+                                    f"missing {sorted(missing)}")
+                features, labels = batch["features"], batch["label"]
+            elif isinstance(batch, (tuple, list)) and len(batch) == 2:
+                features, labels = batch
+            else:
+                raise TypeError("expected each batch to be (features, label) or "
+                                f"{{'features', 'label'}}, got {type(batch).__name__}")
+            if not isinstance(features, dict):
+                raise TypeError(f"expected features to be a dict, got {type(features).__name__}")
+            flat = torch.as_tensor(labels).reshape(-1)
+            for i in range(flat.shape[0]):
+                yield {name: value[i] for name, value in features.items()}, flat[i]
+
+
+    def _fingerprint(payload):
+        blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()[:16]
+
+    cache_dir = Path(cache_dir)
+    if cache_dir.exists() and any(cache_dir.iterdir()) and not overwrite:
+        raise FileExistsError(f"{cache_dir} already has files; pass overwrite=True")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    samples_tmp = cache_dir / "samples.bin.tmp"
+    labels_tmp = cache_dir / "labels.npy.tmp"
+    meta_tmp = cache_dir / "meta.json.tmp"
+    for stale in (samples_tmp, labels_tmp, meta_tmp):
+        stale.unlink(missing_ok=True)
+    if overwrite:
+        (cache_dir / "meta.json").unlink(missing_ok=True)   # invalidate the previous cache
+
+    dataset = processor(**processing_params)
+    loader = DataLoader(dataset, batch_size=64, num_workers=0)
+
+    order, layout = [], {}
+    record_bytes = 0
+    labels = []
+    written = 0
+    started = time.perf_counter()
+
+    try:
+        with open(samples_tmp, "wb") as sink:
+            for features, label in _iter_samples(loader):
+                if not layout:
+                    if not features:
+                        raise ValueError("dataset yielded a sample with no features")
+                    order = list(features)
+                    offset = 0
+                    for name in order:
+                        tensor = torch.as_tensor(features[name])
+                        feature_dtype = dtype
+                        nbytes = tensor.numel() * torch.empty((), dtype=feature_dtype).element_size()
+                        layout[name] = {"shape": tuple(tensor.shape), "dtype": feature_dtype,
+                                        "offset": offset, "nbytes": nbytes}
+                        offset += nbytes
+                    record_bytes = offset
+
+                blobs = []
+                for name in order:
+                    spec = layout[name]
+                    tensor = torch.as_tensor(features[name]).detach().cpu()
+                    shape = tuple(tensor.shape)
+                    if shape != spec["shape"]:
+                        raise ValueError(
+                            f"feature {name!r} has shape {shape}, expected {spec['shape']} "
+                            f"(from the first sample). A cache needs fixed-size records: resample "
+                            f"every sample to one size, or drop the varying feature.")
+                    target_dtype = spec["dtype"]
+                    if tensor.dtype != target_dtype:
+                        tensor = tensor.to(target_dtype)
+
+                    blobs.append(tensor.contiguous().numpy().tobytes())
+                record = b"".join(blobs)
+                if len(record) != record_bytes:
+                    raise RuntimeError(f"sample {written} serialized to {len(record)} bytes, "
+                                       f"expected {record_bytes}")
+                sink.write(record)
+
+                labels.append(int(label))
+                written += 1
+                if log_every and written % int(log_every) == 0:
+                    elapsed = max(time.perf_counter() - started, 1e-9)
+                    print(f"[cache] {written} samples | {written / elapsed:.1f}/s | "
+                          f"{written * record_bytes / 2 ** 30:.2f} GiB")
+
+        if written == 0:
+            raise ValueError("dataset produced no samples; nothing to cache")
+        expected = written * record_bytes
+        actual = samples_tmp.stat().st_size
+        if actual != expected:
+            raise RuntimeError(f"{samples_tmp} is {actual} bytes, "
+                               f"expected {expected} ({written} x {record_bytes})")
+
+        with open(labels_tmp, "wb") as sink:
+            np.save(sink, np.asarray(labels, dtype=np.int64))
+    except BaseException:
+        for stale in (samples_tmp, labels_tmp, meta_tmp):
+            stale.unlink(missing_ok=True)
+        raise
+
+    elapsed = time.perf_counter() - started
+    feature_layout = {name: {"shape": list(spec["shape"]),
+                             "dtype": str(spec["dtype"]).replace("torch.", ""),
+                             "offset": spec["offset"],
+                             "nbytes": spec["nbytes"]}
+                      for name, spec in layout.items()}
+    meta = {"created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "fingerprint": _fingerprint({"processing_params": processing_params,
+                                         "feature_order": order,
+                                         "features": feature_layout}),
+            "n_samples": written,
+            "record_bytes": record_bytes,
+            "label_dtype": "int64",
+            "feature_order": order,
+            "features": feature_layout,
+            "config": processing_params,
+            "source": {"n_samples": len(dataset) if hasattr(dataset, "__len__") else written,
+                       "processing_params": processing_params}}
+
+    with open(meta_tmp, "w") as sink:
+        json.dump(meta, sink, indent=2, default=str)
+    os.replace(labels_tmp, cache_dir / "labels.npy")
+    os.replace(samples_tmp, cache_dir / "samples.bin")
+    os.replace(meta_tmp, cache_dir / "meta.json")      # written last = completeness marker
+
+    print(f"[cache] {written} samples -> {cache_dir} | "
+          f"{record_bytes / 2 ** 10:.0f} KiB/sample | "
+          f"{record_bytes * written / 2 ** 30:.2f} GiB | {elapsed:.1f}s")
+    return {"cache_dir": str(cache_dir), "n_samples": written,
+            "record_bytes": record_bytes, "bytes": record_bytes * written,
+            "features": order, "workers": 0,
+            "dtypes": {name: str(spec["dtype"]).replace("torch.", "") for name, spec in layout.items()},
+            "fingerprint": meta["fingerprint"], "elapsed": elapsed,
+            "samples": str(cache_dir / "samples.bin"),
+            "labels": str(cache_dir / "labels.npy"),
+            "meta": str(cache_dir / "meta.json")}

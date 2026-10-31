@@ -29,7 +29,6 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 import pyarrow.parquet as pq
 from PIL import Image
-from loguru import logger
 
 from torchvision.transforms.functional import center_crop, to_tensor, resize
 import torchvision.transforms as transforms
@@ -306,7 +305,6 @@ class PatchRanker:
         self.scorer = scorer or TextureComplexityScorer()
         self.pad_with = pad_with
         self.ignore_patch_overlap = ignore_patch_overlap
-        self.padded = 0          # ranker calls that needed a repeated patch (one per path)
 
     def __call__(self, patches, image_filter=None):
         """N least / N most textured patches, topped up by repeating a real patch.
@@ -338,18 +336,6 @@ class PatchRanker:
         else:
             take = min(self.n_patches, max(1, available // 2))
 
-        if take < self.n_patches:
-            self.padded += 1
-            needed = self.n_patches if self.ignore_patch_overlap else 2 * self.n_patches
-            if self.padded == 1:         # once is enough: this is a property of the data
-                logger.warning(
-                    "patch stack too small: {} patch(es) for {} per mosaic (need {}) - "
-                    "filling each mosaic with copies of its {} patch; further occurrences "
-                    "are only counted (PatchRanker.padded)",
-                    available, self.n_patches, needed, self.pad_with)
-            else:
-                logger.trace("patch stack too small: {} for {} per mosaic",
-                             available, self.n_patches)
         return self._pad_to_n(patches[order[:take]]), self._pad_to_n(patches[order[-take:]])
 
     def _pad_to_n(self, selected):
@@ -457,7 +443,6 @@ class FeatureBuilder:
         cfg = self.cfg
         poor, rich = self.ranker(patch_stack, cfg.texture_filter)
         bank = self.filters.bank
-        # both mosaics are produced together, exactly like the original pipeline
         return {"poor": self._mosaic(poor, bank, cfg.spatial_patch_scaling_func),
                 "rich": self._mosaic(rich, bank, cfg.spatial_patch_scaling_func)}
 

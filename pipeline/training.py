@@ -880,9 +880,6 @@ class Trainer:
                 logger.info("nothing to train: next epoch {} > num_epochs {}",
                             self.start_epoch + 1, cfg.num_epochs)
 
-            # `epoch` is the internal 0-based index: it is the key into
-            # `history`, the checkpoint payload and the epoch_NNN.pt filename.
-            # Everything a human or the MLflow UI sees is rendered as epoch + 1.
             for epoch in range(self.start_epoch, cfg.num_epochs):
                 train = self.train_one_epoch(epoch)
                 val = self.validate()
@@ -891,8 +888,6 @@ class Trainer:
 
                 score, used_val = self.score(train["loss"], val)
                 self.effective_monitor = cfg.monitor if used_val else "loss"
-                # a fallback score is a train loss, so it must be minimised whatever
-                # monitor_mode says for the (missing) monitored metric
                 effective_mode = cfg.monitor_mode if used_val else "min"
                 if val is not None and not used_val:
                     logger.warning("monitor '{}' not in val={}; falling back to train loss "

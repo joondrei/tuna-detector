@@ -13,3 +13,5 @@ uv sync --all-extras          # or: uv sync --extra all
 To verify, run scripts
 
 Note: mlflow need .env file in root dir with secrets DATABRICKS_HOST and DATABRICKS_TOKEN
+
+dataset used in this pipeline can be downloaded from https://huggingface.co/datasets/Rajarshi-Roy-research/Defactify_Image_Dataset 

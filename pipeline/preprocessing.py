@@ -7,7 +7,7 @@
 #   FilterBank              - residual filters (channel-wise) + FFT high-pass
 #   TextureComplexityScorer - per-patch log-energy score
 #   Scalers                 - registry of patch normalisers (name or callable)
-#   PatchRanker             - pick the N least / most textured patches
+#   PatchRanker             - pick the N least / most textured patches and handle overlap
 #   MosaicAssembler         - N patches -> one grid image
 #   ImageAugmenter          - flip / random crop, RNG injectable
 #   FeatureBuilder          - tensor -> {'feature': tensor} (no io, no workers)
@@ -16,9 +16,6 @@
 #
 # Filters (Laplacian + the 30-kernel residual bank) live in configs/filters.py
 #
-# `FeatureDataset(**processing_parameters, seed=SEED)` is a drop-in replacement
-# for `DatasetPreprocessing` (same kwargs, same yielded dict), and every part is
-# injectable, so it also works as `Trainer(..., dataset_factory=FeatureDataset)`.
 # =============================================================================
 
 # -------------------------------------------------------------------- usage
@@ -77,7 +74,7 @@ FEATURE_NAMES = ("residuals", "tc", "prepatch", "poor", "rich", "fft_poor", "fft
 PAD_CHOICES = ("min_rank", "max_rank")
 
 
-# ------------------------------------------------------------------ config
+# config
 class ProcessingConfig:
     """Validates `processing_parameters` for the preprocessing pipeline."""
 
@@ -110,7 +107,7 @@ class ProcessingConfig:
         self.ignore_patch_overlap = ignore_patch_overlap
         self.validate()
 
-    # -- validation --------------------------------------------------------
+    # validation
     def validate(self):
         unknown = set(self.features) - set(FEATURE_NAMES)
         if not self.features or unknown:
@@ -130,7 +127,6 @@ class ProcessingConfig:
                              f"got {self.ignore_patch_overlap!r}")
         return self
 
-    # -- derived -----------------------------------------------------------
     @property
     def needs_residuals(self):
         return "residuals" in self.features or "tc" in self.features
@@ -170,7 +166,7 @@ class ProcessingConfig:
                 "ignore_patch_overlap": self.ignore_patch_overlap}
 
 
-# ------------------------------------------------------------- colour space
+# colour space
 class ColorSpaceConverter:
     """RGB tensor (*, 3, H, W) -> one luma/chroma plane or a full YCbCr stack."""
 
@@ -199,7 +195,7 @@ class ColorSpaceConverter:
         raise ValueError(f"unknown channel {self.channel!r}")
 
 
-# ----------------------------------------------------------------- patches
+# patches
 class PatchExtractor:
     """Crops to a multiple of `patch_size` then unfolds into non-overlapping patches."""
 
@@ -222,7 +218,7 @@ class PatchExtractor:
         return patches.view(-1, image.shape[0], p, p)
 
 
-# ----------------------------------------------------------------- filters
+# filters
 class FilterBank:
     """Residual convolution (channel-wise) and the FFT high-pass residual."""
 
@@ -262,7 +258,7 @@ class FilterBank:
         return torch.abs(filtered)
 
 
-# --------------------------------------------------------- texture scoring
+# texture scoring
 class TextureComplexityScorer:
     """sum of 2^-|r| * |r| over each patch: low for smooth, high for textured."""
 
@@ -351,7 +347,7 @@ class PatchRanker:
         k < 2 * n_patches, and for k <= n_patches the two selections are the *same*
         set, so both mosaics come out identical.
 
-        Either way, a mosaic with fewer than n_patches real patches is filled up to
+        A mosaic with fewer than n_patches real patches is filled up to
         n_patches with copies of one of its own patches, chosen by `pad_with`:
         "min_rank" repeats the least textured patch of that mosaic, "max_rank" the
         most textured one.
@@ -397,7 +393,7 @@ class MosaicAssembler:
                        .reshape(channels, side * dims, side * dims))
 
 
-# --------------------------------------------------------------- augmenting
+# augmenting
 class ImageAugmenter:
     """Flip + random crop >= 256 px. Pass `generator=` for an isolated RNG stream."""
 
@@ -411,9 +407,9 @@ class ImageAugmenter:
 
     def __call__(self, image):
         if self._uniform() < self.prob:
-            image = torch.flip(image, dims=[-1])          # horizontal flip
+            image = torch.flip(image, dims=[-1])          
         if self._uniform() < self.prob:
-            image = torch.flip(image, dims=[-2])          # vertical flip
+            image = torch.flip(image, dims=[-2])          
 
         img_h, img_w = image.shape[-2:]
         if img_h < self.min_crop or img_w < self.min_crop:
@@ -428,7 +424,7 @@ class ImageAugmenter:
         return image
 
 
-# ----------------------------------------------------------- feature builder
+# feature builder
 class FeatureBuilder:
     """image tensor -> {'feature': tensor}."""
 
@@ -450,7 +446,7 @@ class FeatureBuilder:
         augmenter = ImageAugmenter() if config.augment else None
         return cls(config, augmenter=augmenter)
 
-    # -- parts ------------------------------------------------------------
+    # feature generators
     def _mosaic(self, selected, spatial_filter, scaling_fnc):
         """spatial filter -> scaling -> grid, in that order."""
         patches = selected
@@ -485,7 +481,6 @@ class FeatureBuilder:
         return {"fft_poor": self._mosaic(poor, None, cfg.freq_patch_scaling_func),
                 "fft_rich": self._mosaic(rich, None, cfg.freq_patch_scaling_func)}
 
-    # -- entry point -------------------------------------------------------
     def __call__(self, image_tensor):
         cfg = self.cfg
         image = self.converter(image_tensor)
@@ -513,7 +508,7 @@ class FeatureBuilder:
         return features
 
 
-# -------------------------------------------------------------------- source
+# source
 class ParquetImageSource:
     """Sharded, epoch-shuffled parquet stream yielding (image tensor, label)."""
 
@@ -552,7 +547,7 @@ class ParquetImageSource:
                     yield to_tensor(image), torch.tensor(label, dtype=torch.long)
 
 
-# ------------------------------------------------------------------ dataset
+# dataset
 class FeatureDataset(IterableDataset):
     """`DatasetPreprocessing`, split into a source and a feature builder.
 
@@ -620,8 +615,8 @@ class CachedFeatureDataset(Dataset):
 
         self.meta = json.loads(meta_path.read_text())
 
-        self.features = self.meta["features"]         # name -> shape/dtype/offset/nbytes
-        self.feature_names = list(self.meta["feature_order"])   # record packing order
+        self.features = self.meta["features"]         
+        self.feature_names = list(self.meta["feature_order"])  
         self.n_samples = int(self.meta["n_samples"])
         self.record_bytes = int(self.meta["record_bytes"])
         self.fingerprint = self.meta.get("fingerprint")
@@ -630,7 +625,7 @@ class CachedFeatureDataset(Dataset):
         self._mm = None
         self._labels = None
 
-        # refusals that would otherwise train on silently wrong features
+        # refusals wrong features
         if features is not None:
             given = self.feature_order(features)
             if given != self.feature_names:
@@ -660,7 +655,7 @@ class CachedFeatureDataset(Dataset):
                                f"expected {expected} ({self.n_samples} x "
                                f"{self.record_bytes}); cache truncated?")
 
-    # -- Trainer adapter ---------------------------------------------------
+    # Trainer adapter 
     @classmethod
     def factory(cls, cache_dir, **defaults):
         """`dataset_factory` adapter: absorbs the processing kwargs Trainer passes.
@@ -703,7 +698,7 @@ class CachedFeatureDataset(Dataset):
         start = spec["offset"]
         chunk = record[start:start + spec["nbytes"]]
         array = np.frombuffer(chunk, dtype=self._np_dtype(spec["dtype"]))
-        array = array.reshape(spec["shape"]).astype(np.float32)   # copy: leaves mmap alone
+        array = array.reshape(spec["shape"]).astype(np.float32)   
         if spec["dtype"] == "uint8":
             array /= 255.0
         return torch.from_numpy(array)
@@ -718,10 +713,9 @@ class CachedFeatureDataset(Dataset):
         return {"features": features,
                 "label": torch.tensor(int(self.labels[index]), dtype=torch.long)}
 
-    # -- pickling ----------------------------------------------------------
     def __getstate__(self):
         state = self.__dict__.copy()
-        state["_mm"] = None              # both are reopened lazily in each worker
+        state["_mm"] = None             
         state["_labels"] = None
         return state
 

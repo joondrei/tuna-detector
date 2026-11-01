@@ -6,6 +6,14 @@ from models.model import build_custom_resnet_model
 
 SEED = 42
 
+from pipeline.preprocessing import Scalers
+import torch
+def Power_Transform_Normalized_Patches(patches, power=0.5, eps=1e-8, cutoff = 0.5):
+    patches = patches.clamp(-cutoff, cutoff)
+    patches = torch.sign(patches) * torch.pow(patches.abs() + eps, power)
+    return Scalers().minmax_patches(patches)
+
+
 processing_parameters = {
     "filepattern": str(DATA_DIR / TRAIN_PATTERN),
     "features": ["fft_poor", "fft_rich"],
@@ -26,18 +34,18 @@ processing_parameters = {
 }
 
 training_parameters = {
-    "num_epochs": 20,
+    "num_epochs": 1,
     "batch_size": 64,
     "learning_rate": 1e-3,
     "weight_decay": 0.0,
     "pos_weight": 0.2,                 
-    "dataset_workers": 0,
-    "max_samples_per_epoch": 1000,      
+    "dataset_workers": 4,
+    "max_samples_per_epoch": 10000,      
     "log_every": 5,                    
     "grad_clip": None,
     "threshold": 0.5,
 
-    "checkpoint_dir": "checkpoints",   
+    "checkpoint_dir": "checkpoints/peak",   
     "checkpoint_every": 1,             
     "keep_checkpoints": 5,
     "monitor": "auroc",                
@@ -48,12 +56,10 @@ training_parameters = {
     "resume_from": None,              
 }
 
-validator = Evaluator(batch_size=64,
-          workers=0,
-          max_samples=300,
-          threshold=0.5,
-          dataset_factory=FeatureDataset
-)
+
+# batch_size / workers / threshold / criterion are inherited from
+# training_parameters by Trainer.build(); max_samples is a val-only cap.
+validator = Evaluator()
 
 trainer = Trainer(processing_parameters, build_custom_resnet_model, training_parameters,
                   seed=SEED,

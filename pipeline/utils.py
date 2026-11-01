@@ -1,12 +1,3 @@
-"""Shared, dependency-light helpers used by the pipeline modules.
-
-Everything here was previously defined in the notebook cells:
-`fixed_rngs`, `seed_worker`, `make_metrics`, `_resolve_device`, `_sanitize`,
-`_atomic_torch_save`, `_flat_params`, `_jsonable`.
-
-The leading underscores are kept so the call sites in `training.py` stay
-identical to the notebook version.
-"""
 import os
 import random
 from pathlib import Path
@@ -34,7 +25,7 @@ __all__ = ["fixed_rngs", "seed_worker", "make_metrics", "rng_generator",
            "_summary", "_flat_params", "_jsonable"]
 
 
-# --------------------------------------------------------------------- rngs
+# rngs
 def fixed_rngs(seed=42, deterministic=True, warn_only=True):
     """Seed every RNG used by the preprocess -> train -> eval pipeline."""
     seed = int(seed)
@@ -71,7 +62,7 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-# ---------------------------------------------------------------- device/io
+# device/io
 def _resolve_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -126,7 +117,7 @@ def prune_checkpoints(directory, keep=5, prefix="epoch_"):
     return removed
 
 
-# ------------------------------------------------------------------ metrics
+# metrics
 def make_metrics(device, threshold=0.5):
     """torcheval binary metrics take PROBABILITIES and threshold internally."""
     return {
@@ -137,7 +128,7 @@ def make_metrics(device, threshold=0.5):
     }
 
 
-# ------------------------------------------------------- config serialising
+# config serialising
 def _sanitize(obj):
     """Make configs safe for torch.load(..., weights_only=True)."""
     if isinstance(obj, dict):
@@ -210,37 +201,38 @@ def timeit(func: Callable[P, R]) -> Callable[P, R]:
 
     return timeit_wrapper
 
+def iter_samples(loader):
+    """Yield ({name: tensor}, label) one sample at a time from collated batches."""
+    for batch in loader:
+        if isinstance(batch, dict):
+            missing = {"features", "label"} - batch.keys()
+            if missing:
+                raise TypeError(f"expected a batch dict with 'features' and 'label', "
+                                f"missing {sorted(missing)}")
+            features, labels = batch["features"], batch["label"]
+        elif isinstance(batch, (tuple, list)) and len(batch) == 2:
+            features, labels = batch
+        else:
+            raise TypeError("expected each batch to be (features, label) or "
+                            f"{{'features', 'label'}}, got {type(batch).__name__}")
+        if not isinstance(features, dict):
+            raise TypeError(f"expected features to be a dict, got {type(features).__name__}")
+        flat = torch.as_tensor(labels).reshape(-1)
+        for i in range(flat.shape[0]):
+            yield {name: value[i] for name, value in features.items()}, flat[i]
 
 def build_cache(cache_dir, processing_params, processor, dtype=torch.float32,
                 overwrite=False, log_every=250):
     """Write a fixed-size-record binary cache from a DataLoader over processor(**processing_params).
 
     `dtype` must be torch.float32 or torch.float16.
+    torch.uint8 is not supported because features need to be normalised to [0, 1]
+    and casting uint8 -> float32 is lossy.
+
     """
     if dtype is torch.uint8:
         raise ValueError(
-            "dtype=torch.uint8 is not supported: casting normalised features in [0, 1] "
-
-    def _iter_samples(loader):
-        """Yield ({name: tensor}, label) one sample at a time from collated batches."""
-        for batch in loader:
-            if isinstance(batch, dict):
-                missing = {"features", "label"} - batch.keys()
-                if missing:
-                    raise TypeError(f"expected a batch dict with 'features' and 'label', "
-                                    f"missing {sorted(missing)}")
-                features, labels = batch["features"], batch["label"]
-            elif isinstance(batch, (tuple, list)) and len(batch) == 2:
-                features, labels = batch
-            else:
-                raise TypeError("expected each batch to be (features, label) or "
-                                f"{{'features', 'label'}}, got {type(batch).__name__}")
-            if not isinstance(features, dict):
-                raise TypeError(f"expected features to be a dict, got {type(features).__name__}")
-            flat = torch.as_tensor(labels).reshape(-1)
-            for i in range(flat.shape[0]):
-                yield {name: value[i] for name, value in features.items()}, flat[i]
-
+            "dtype=torch.uint8 is not supported: casting normalised features in [0, 1] ")
 
     def _fingerprint(payload):
         blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -270,7 +262,7 @@ def build_cache(cache_dir, processing_params, processor, dtype=torch.float32,
 
     try:
         with open(samples_tmp, "wb") as sink:
-            for features, label in _iter_samples(loader):
+            for features, label in iter_samples(loader):
                 if not layout:
                     if not features:
                         raise ValueError("dataset yielded a sample with no features")

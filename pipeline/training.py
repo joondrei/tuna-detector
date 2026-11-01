@@ -8,7 +8,8 @@
 #   MlflowTracker   - adapter mapping trainer events onto mlflow
 #   NullValidator   - no-op validation, so validation is always optional
 #   CallableValidator - adapter for a legacy (eval_fn, eval_loader) pair
-#   Evaluator       - owns the val loader, the metrics and the reporting
+#   Evaluator       - owns the val loader, the metrics and the reporting; its
+#                     threshold / batch size / criterion come from TrainConfig
 #   Trainer         - orchestration: build -> resume -> loop -> finalize
 #
 # Every collaborator is injectable (model factory, dataset factory, metric
@@ -18,6 +19,26 @@
 # .preprocessing (FeatureDataset), loguru (all logging) and, only for
 # MlflowTracker, mlflow.
 # =============================================================================
+
+# ------------------------------------------------------------------- usage
+# validation with the built-in evaluator (val loader derived from processing_parameters)
+# trainer = Trainer(processing_parameters, build_model, training_parameters, seed=SEED,
+#                   dataset_factory=FeatureDataset,
+#                   validation=Evaluator(dataset_factory=FeatureDataset))
+# result = trainer.fit()
+
+# legacy pair still accepted (wrapped in CallableValidator):
+# Trainer(..., eval_fn=evaluate_model, eval_loader=val_loader).fit()
+
+# resume (model, optimizer, RNG, history and early-stopping state all come
+# from the checkpoint, so a fresh Trainer simply continues):
+# training_parameters["num_epochs"] += 5
+# trainer = Trainer(processing_parameters, build_model,
+#                   dict(training_parameters, resume_from="auto"), seed=SEED,
+#                   validation=Evaluator(), tracker=MlflowTracker(
+#                       MLFLOW_TRACKING_URI, MLFLOW_EXPERIMENT))
+# result = trainer.fit()
+
 import dataclasses
 import math
 import time
@@ -35,21 +56,21 @@ try:                                   # optional: NullTracker needs no mlflow
     import mlflow
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors.platform import ResourceDoesNotExist
-except ImportError:                    # pragma: no cover
+except ImportError:                    
     mlflow = None
 
 from configs.pipeline_config import SEED
 from .preprocessing import FeatureDataset
 from .utils import (_atomic_torch_save, _flat_params, _jsonable, _resolve_device,
                     _sanitize, fixed_rngs, make_metrics, prune_checkpoints,
-                    seed_worker, timeit)
+                    rng_generator, seed_worker, timeit)
 
 __all__ = ["TrainConfig", "EarlyStopping", "CheckpointStore", "NullTracker",
            "MlflowTracker", "NullValidator", "CallableValidator", "Evaluator",
            "Trainer", "move_batch", "train_step", "update_metrics"]
 
 
-# ------------------------------------------------------------------ config
+# config
 @dataclass
 class TrainConfig:
     """Validated training parameters. `TrainConfig.from_dict(training_parameters)`."""
@@ -110,7 +131,7 @@ class TrainConfig:
         return math.ceil(self.max_samples_per_epoch / self.batch_size)
 
 
-# ---------------------------------------------------------- early stopping
+# early stopping
 @dataclass
 class EarlyStopping:
     """Tracks the monitored score for early stopping."""
@@ -155,7 +176,7 @@ class EarlyStopping:
         self.no_improve = int(state.get("no_improve", self.no_improve))
 
 
-# ------------------------------------------------------------- checkpoints
+# checkpoints
 class CheckpointStore:
     """_atomic_torch_save provides safe recovery; epoch files are pruned to `keep`."""
 
@@ -198,7 +219,7 @@ class CheckpointStore:
         return torch.load(self.best_path, map_location=map_location, weights_only=True)
 
 
-# ---------------------------------------------------------------- trackers
+# trackers
 class NullTracker:
     """No-op tracker: `Trainer` never imports or needs mlflow."""
 
@@ -250,7 +271,6 @@ class MlflowTracker(NullTracker):
         self._run = None
         self.run_id = None
 
-    # -- lifecycle ---------------------------------------------------------
     def start(self, run_name=None, tags=None):
         if mlflow is None:
             raise RuntimeError("MlflowTracker requires mlflow (pip install mlflow); "
@@ -295,7 +315,7 @@ class MlflowTracker(NullTracker):
             mlflow.end_run(status=status)
             self._run = None
 
-    # -- logging -----------------------------------------------------------
+    # logging 
     def log_params(self, params, config=None):
         if not self._log_params:
             return
@@ -362,7 +382,7 @@ class MlflowTracker(NullTracker):
             mlflow.log_metrics(metrics)
 
 
-# -------------------------------------------------------------- validation
+# validation
 class NullValidator:
     """No-op validation:
 
@@ -371,6 +391,10 @@ class NullValidator:
     """
 
     name = "none"
+
+    def bind(self, cfg, criterion=None):
+        """Adopt training-config defaults (no-op: nothing to configure)."""
+        return self
 
     def build_loader(self, proc_p, seed=42):
         return None
@@ -405,31 +429,76 @@ class Evaluator(NullValidator):
     """Validation component: combines loader and evaluation and returns metrics.
 
     Evaluator()                                  # dataloader configured by proc_p
-    Evaluator(max_samples=300)                   # cheap sanity checks
+    Evaluator(max_samples=300)                   # cheap sanity checks (val-only cap)
     Evaluator(dataset_factory=FeatureDataset)    # Preprocessing pipeline used by dataloader
     Evaluator(loader=my_loader)                  # custom dataloader
+    Evaluator(threshold=0.3)                     # explicit operating point
+
+    Batch size, worker count, threshold and the loss criterion default to the
+    training config: `Trainer.build()` calls `bind(cfg, criterion)` before the
+    val loader exists, so val metrics are measured at the same operating point
+    as the train metrics and val loss is directly comparable to train loss.
+    Anything passed explicitly here always wins over the training config.
     """
 
     name = "val"
 
-    def __init__(self, loader=None, filepattern=None, batch_size=64, workers=0,
-                 max_samples=None, threshold=0.5, criterion=None,
+    DEFAULT_BATCH_SIZE = 64
+    DEFAULT_WORKERS = 0
+    DEFAULT_THRESHOLD = 0.5
+
+    def __init__(self, loader=None, filepattern=None, batch_size=None, workers=None,
+                 max_samples=None, threshold=None, criterion=None,
                  dataset_factory=FeatureDataset, metric_factory=None,
                  pin_memory=None, device=None):
         self.loader = loader
         self.filepattern = filepattern
-        self.batch_size = int(batch_size)
-        self.workers = int(workers)
+        self.batch_size = None if batch_size is None else int(batch_size)
+        self.workers = None if workers is None else int(workers)
         self.max_samples = max_samples
-        self.threshold = float(threshold)
+        self.threshold = None if threshold is None else float(threshold)
         self.criterion = criterion
         self.dataset_factory = dataset_factory
         self.metric_factory = metric_factory
         self.pin_memory = pin_memory
         self.device = device
         self.dataset = None
+        # an explicitly passed value is never overwritten by bind()
+        self._explicit = {"batch_size": batch_size is not None,
+                          "workers": workers is not None,
+                          "threshold": threshold is not None,
+                          "criterion": criterion is not None}
 
-    # -- loader ------------------------------------------------------------
+    # config
+    def bind(self, cfg, criterion=None):
+        """Fill unset settings from the training config (`TrainConfig`).
+
+        Called by `Trainer.build()`; explicit constructor values win, so the
+        val side can never silently disagree with training.
+        """
+        if not self._explicit["batch_size"]:
+            self.batch_size = int(cfg.batch_size)
+        if not self._explicit["workers"]:
+            self.workers = int(cfg.dataset_workers or 0)
+        if not self._explicit["threshold"]:
+            self.threshold = float(cfg.threshold)
+        if not self._explicit["criterion"] and criterion is not None:
+            self.criterion = criterion            # same pos_weight as training
+        return self
+
+    @property
+    def eval_batch_size(self):
+        return self.DEFAULT_BATCH_SIZE if self.batch_size is None else self.batch_size
+
+    @property
+    def eval_workers(self):
+        return self.DEFAULT_WORKERS if self.workers is None else self.workers
+
+    @property
+    def eval_threshold(self):
+        return self.DEFAULT_THRESHOLD if self.threshold is None else self.threshold
+
+    # loader
     def resolve_filepattern(self, proc_p):
         """Explicit `filepattern`, else the training pattern with train -> val."""
         if self.filepattern:
@@ -451,17 +520,19 @@ class Evaluator(NullValidator):
         eval_p["augment"] = False          
         eval_p["shuffle"] = False
         self.dataset = self.dataset_factory(**eval_p, seed=seed)
-        self.loader = DataLoader(
-            self.dataset, batch_size=self.batch_size, num_workers=self.workers,
-            pin_memory=(torch.cuda.is_available() if self.pin_memory is None
-                        else bool(self.pin_memory)))
+        kwargs = dict(batch_size=self.eval_batch_size, num_workers=self.eval_workers,
+                      pin_memory=(torch.cuda.is_available() if self.pin_memory is None
+                                  else bool(self.pin_memory)))
+        if self.eval_workers > 0:          # reproducible worker RNG (mirrors Trainer._make_loader)
+            kwargs.update(generator=rng_generator(seed), worker_init_fn=seed_worker)
+        self.loader = DataLoader(self.dataset, **kwargs)
         return self.loader
 
-    # -- evaluation --------------------------------------------------------
+    # evaluation
     def metrics(self, device):
         if self.metric_factory is not None:
-            return self.metric_factory(device, self.threshold)
-        return make_metrics(device, self.threshold)
+            return self.metric_factory(device, self.eval_threshold)
+        return make_metrics(device, self.eval_threshold)
 
     def __call__(self, model):
         if self.loader is None:
@@ -471,7 +542,7 @@ class Evaluator(NullValidator):
         device = torch.device(self.device) if self.device else next(model.parameters()).device
         criterion = self.criterion or nn.BCEWithLogitsLoss()
         metrics = self.metrics(device)
-        batch_size = int(getattr(self.loader, "batch_size", self.batch_size))
+        batch_size = int(getattr(self.loader, "batch_size", None) or self.eval_batch_size)
 
         was_training = model.training
         model.eval()
@@ -503,7 +574,7 @@ class Evaluator(NullValidator):
         return results
 
 
-# ------------------------------------------------------- decoupled helpers
+# decoupled helpers
 def move_batch(batch, device):
     """DataLoader batch -> (inputs, labels). Caches to device memory"""
     inputs = [feat.to(device, non_blocking=True) for feat in batch["features"].values()]
@@ -528,7 +599,7 @@ def update_metrics(metrics, probs, labels):
         metric.update(probs.float(), labels.int())
 
 
-# ----------------------------------------------------------------- trainer
+# trainer
 class Trainer:
     """Orchestrates training from injectable, independently testable parts.
 
@@ -583,14 +654,14 @@ class Trainer:
 
     @staticmethod
     def _resolve_validation(validation, eval_fn, eval_loader):
-        """Explicit validator wins; legacy pair is wrapped; otherwise no-op."""
+        """Explicit validator priority; legacy pair is wrapped; otherwise no-op."""
         if validation is not None:
             return validation
         if eval_fn is not None and eval_loader is not None:
             return CallableValidator(eval_fn, eval_loader)
         return NullValidator()
 
-    # ------------------------------------------------------------- describe
+    # describe for mlflow
     def run_name(self):
         cfg = self.cfg
         return "{}|{}|bs{}|lr{:g}|seed{}".format(
@@ -618,7 +689,7 @@ class Trainer:
                 "training": _sanitize(self.cfg.to_dict()),
                 "seed": self.seed}
 
-    # ---------------------------------------------------------------- build
+    # build
     @timeit
     def build(self):
         cfg = self.cfg
@@ -638,6 +709,9 @@ class Trainer:
 
         self.dataset = self.dataset_factory(**self.proc, seed=self.seed)
         self.dataloader = self._make_loader(self.dataset)
+        # hand the training config to the validator first, so its loader and its
+        # metrics use the training threshold / criterion (no-op for NullValidator)
+        self.validation.bind(self.cfg, self.criterion)
         self.validation.build_loader(self.proc, self.seed)   # no-op for NullValidator
 
         self.store = CheckpointStore(cfg.checkpoint_dir, cfg.checkpoint_every,
@@ -657,7 +731,7 @@ class Trainer:
             kwargs.update(generator=self.gen, worker_init_fn=seed_worker)
         return DataLoader(dataset, **kwargs)
 
-    # --------------------------------------------------------------- resume
+    # resume checkpoint
     @timeit
     def restore(self):
         """Load model/optimizer/RNG/history; returns True when a checkpoint was used."""
@@ -708,7 +782,7 @@ class Trainer:
             logger.warning("checkpoint was written by run {}; this run ({}) replays "
                            "its history", prev_run, self.tracker.run_id)
 
-    # ---------------------------------------------------------------- epoch
+    # epoch
     def train_one_epoch(self, epoch):
         cfg = self.cfg
         self.dataset.set_epoch(epoch)          # reshuffle data sources per worker
@@ -862,7 +936,7 @@ class Trainer:
             return True
         return False
 
-    # ------------------------------------------------------------------ fit
+    # fit
     @timeit
     def fit(self):
         if self.model is None:
@@ -965,21 +1039,3 @@ class Trainer:
                 "mlflow_run_id": self.tracker.run_id}
 
 
-# ------------------------------------------------------------------- usage
-# validation with the built-in evaluator (val loader derived from processing_parameters)
-# trainer = Trainer(processing_parameters, build_model, training_parameters, seed=SEED,
-#                   dataset_factory=FeatureDataset,
-#                   validation=Evaluator(dataset_factory=FeatureDataset))
-# result = trainer.fit()
-
-# legacy pair still accepted (wrapped in CallableValidator):
-# Trainer(..., eval_fn=evaluate_model, eval_loader=val_loader).fit()
-
-# resume (model, optimizer, RNG, history and early-stopping state all come
-# from the checkpoint, so a fresh Trainer simply continues):
-# training_parameters["num_epochs"] += 5
-# trainer = Trainer(processing_parameters, build_model,
-#                   dict(training_parameters, resume_from="auto"), seed=SEED,
-#                   validation=Evaluator(), tracker=MlflowTracker(
-#                       MLFLOW_TRACKING_URI, MLFLOW_EXPERIMENT))
-# result = trainer.fit()

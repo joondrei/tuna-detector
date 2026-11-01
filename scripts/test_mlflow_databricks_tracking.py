@@ -85,10 +85,7 @@ def main() -> int:
     }
 
     validator = Evaluator(
-        batch_size=64,
-        workers=0,
         max_samples=300,
-        threshold=0.5,
         dataset_factory=FeatureDataset
     )
 

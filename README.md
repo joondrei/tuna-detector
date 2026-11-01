@@ -3,7 +3,7 @@ repo for my masters thesis, under construction
 Done:
 full training pipeline featuring patch based noise extraction with options for live preprocessing or cache generation, and training with MLFlow experiment tracking
 
-To dp:
+To do:
 Optuna hyperparameter search with parallelization orchestrated by airflow
 
 To setup, run:

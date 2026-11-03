@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from configs.pipeline_config import DATA_DIR, processing_parameters, training_parameters
-from models.model import build_custom_resnet_model
+from models.model import CustomResNet18
 from pipeline.preprocessing import CachedFeatureDataset
 from pipeline.training import Evaluator, MlflowTracker, NullTracker, Trainer
 from pipeline.utils import resolve_experiment
@@ -27,11 +27,11 @@ from pipeline.utils import resolve_experiment
 load_dotenv()
 
 SEED = 42
-METRIC = "auroc"            # Metric being optimized
+METRIC = "auroc"                 # Metric being optimized
 
-# --------------------------------------------------------------- SETTINGS
+# TUNER SETTINGS
 STUDY_NAME = "resnet"            
-TARGET_TRIALS = 30               # stop when the study holds this many trials
+TARGET_TRIALS = 40               # stop when the study holds this many trials
                                  # if already reached, the process does nothing and exits
 EPOCHS = 10                      # epochs per trial
 SAMPLES_PER_EPOCH = None         # None = a full pass over the train cache
@@ -128,15 +128,22 @@ def objective(trial):
     # processing / cache configuration
     proc_p = dict(processing_parameters)
 
-    # tuned hyperparameters
-    tuned = {
+    # tuned training hyperparameters examples
+    train_tuned = {
         "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True),
         "batch_size": trial.suggest_int("batch_size", 16, 64, step=16),
     }
 
+    # tuned model hyperparameters
+    model_tuned = {
+        "model": "resnet_sample",
+        "n" :trial.suggest_categorical("n", [4, 7, 9]),
+        "use_dropout" : trial.suggest_categorical("use_dropout", [False, True])
+    }
+
     # apply
     train_p = dict(training_parameters)
-    train_p.update(tuned)
+    train_p.update(train_tuned)
     train_p.update(
         num_epochs=EPOCHS,
         max_samples_per_epoch=SAMPLES_PER_EPOCH,
@@ -146,8 +153,13 @@ def objective(trial):
         keep_checkpoints=0,
     )
 
+    # Delays model creation so the seed set in Trainer.build() takes effect
+    def tune_custom_resnet():
+        return CustomResNet18(in_channels=1, n=model_tuned["n"],
+                              res_option="A", use_dropout=model_tuned["use_dropout"])
+
     trainer = Trainer(
-        proc_p, build_custom_resnet_model, train_p,
+        proc_p, tune_custom_resnet, train_p,
         seed=SEED + trial.number,
         dataset_factory=CachedFeatureDataset.factory(DATA_DIR / "cache/train"),
         validation=Evaluator(
@@ -156,19 +168,37 @@ def objective(trial):
         ),
 
         tracker=make_tracker(trial),
+        extra_params=model_tuned,
     )
     return trainer.fit()["best_score"]
 
 
+def make_storage():
+    """Postgresql store, or None when no database can be reached."""
+    try:
+        dsn = (f"postgresql+psycopg2://{os.environ['OPTUNA_USER']}:"
+               f"{os.environ['OPTUNA_PASSWORD']}@"
+               f"{os.environ.get('OPTUNA_HOST', 'localhost')}:"
+               f"{os.environ.get('OPTUNA_PORT', '5434')}/"
+               f"{os.environ['OPTUNA_DB']}")
+        storage = optuna.storages.RDBStorage(url=dsn,
+                                             heartbeat_interval=HEARTBEAT_INTERVAL,
+                                             grace_period=HEARTBEAT_GRACE)
+        storage.get_all_studies()        # cheap read: also fails on a broken schema
+    except Exception as exc:             # missing keys, no server, wrong password, ...
+        logger.warning("no Optuna database ({}: {}); tuning in memory, "
+                       "trials are lost on exit and cannot be shared",
+                       type(exc).__name__, exc)
+        return None
+    logger.info("study storage: postgres at {}:{}/{}",
+                os.environ.get("OPTUNA_HOST", "localhost"),
+                os.environ.get("OPTUNA_PORT", "5434"),
+                os.environ["OPTUNA_DB"])
+    return storage
+
+
 def build_study():
-    dsn = (f"postgresql+psycopg2://{os.environ['OPTUNA_USER']}:"
-           f"{os.environ['OPTUNA_PASSWORD']}@"
-           f"{os.environ.get('OPTUNA_HOST', 'localhost')}:"
-           f"{os.environ.get('OPTUNA_PORT', '5434')}/"
-           f"{os.environ['OPTUNA_DB']}")
-    storage = optuna.storages.RDBStorage(url=dsn,
-                                         heartbeat_interval=HEARTBEAT_INTERVAL,
-                                         grace_period=HEARTBEAT_GRACE)
+    storage = make_storage()
     pruner = optuna.pruners.MedianPruner(n_startup_trials=STARTUP_TRIALS,
                                          n_warmup_steps=PRUNE_WARMUP)
     study = optuna.create_study(study_name=STUDY_NAME, storage=storage,

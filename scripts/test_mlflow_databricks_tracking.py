@@ -37,8 +37,8 @@ def load_env() -> None:
 
 def main() -> int:
     load_env()
-    require("mlflow", "mlflow")
-    require("databricks.sdk", "databricks")
+    require("mlflow", "all")
+    require("databricks.sdk", "all")
 
     SEED = 42
 

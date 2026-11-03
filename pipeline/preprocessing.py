@@ -30,7 +30,7 @@
 #     "unused", features=["fft_poor", "fft_rich"], colorspace="Y"))
 
 # ------------------------------------------------------------- cached usage
-# from pipeline.utils import build_cache
+# from scripts.build_dataset_cache import build_cache
 # from pipeline.preprocessing import FeatureDataset, CachedFeatureDataset
 #
 # build_cache("cache/train", processing_parameters, FeatureDataset, overwrite=True)
@@ -588,7 +588,7 @@ class FeatureDataset(IterableDataset):
             yield {"features": self.builder(image), "label": label}
 
 class CachedFeatureDataset(Dataset):
-    """Map-style reader for a directory written by `pipeline.utils.build_cache()`.
+    """Map-style reader for a directory written by `scripts/build_dataset_cache.py`.
 
         dataset = CachedFeatureDataset("cache/train")
         loader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=8,
@@ -611,7 +611,7 @@ class CachedFeatureDataset(Dataset):
         if not meta_path.is_file():
             raise FileNotFoundError(
                 f"{self.cache_dir} is not a complete cache (no meta.json); build it "
-                f"with pipeline.utils.build_cache(...)")
+                f"with scripts/build_dataset_cache.py")
 
         self.meta = json.loads(meta_path.read_text())
 

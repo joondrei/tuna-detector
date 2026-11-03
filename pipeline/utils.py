@@ -1,18 +1,14 @@
 import os
 import random
-import subprocess
-import sys
 from pathlib import Path
 import hashlib
 import json
-from datetime import datetime, timezone
 
 
 import numpy as np
 import torch
 from torcheval.metrics import (BinaryAccuracy, BinaryAUROC, BinaryF1Score,
                                BinaryRecall)
-from torch.utils.data import DataLoader
 
 from loguru import logger
 from collections.abc import Callable
@@ -25,7 +21,7 @@ R = TypeVar("R")
 __all__ = ["fixed_rngs", "seed_worker", "make_metrics", "rng_generator",
            "prune_checkpoints", "_resolve_device", "_sanitize", "_atomic_torch_save",
            "_summary", "_flat_params", "_jsonable", "resolve_experiment",
-           "DEFAULT_MLFLOW_EXPERIMENT_ROOT", "check_cache", "ensure_cache"]
+           "DEFAULT_MLFLOW_EXPERIMENT_ROOT"]
 
 
 # mlflow experiment naming
@@ -232,216 +228,8 @@ def timeit(func: Callable[P, R]) -> Callable[P, R]:
 
     return timeit_wrapper
 
-def iter_samples(loader):
-    """Yield ({name: tensor}, label) one sample at a time from collated batches."""
-    for batch in loader:
-        if isinstance(batch, dict):
-            missing = {"features", "label"} - batch.keys()
-            if missing:
-                raise TypeError(f"expected a batch dict with 'features' and 'label', "
-                                f"missing {sorted(missing)}")
-            features, labels = batch["features"], batch["label"]
-        elif isinstance(batch, (tuple, list)) and len(batch) == 2:
-            features, labels = batch
-        else:
-            raise TypeError("expected each batch to be (features, label) or "
-                            f"{{'features', 'label'}}, got {type(batch).__name__}")
-        if not isinstance(features, dict):
-            raise TypeError(f"expected features to be a dict, got {type(features).__name__}")
-        flat = torch.as_tensor(labels).reshape(-1)
-        for i in range(flat.shape[0]):
-            yield {name: value[i] for name, value in features.items()}, flat[i]
-
-def check_cache(cache_dir, processing_params, splits=("train", "val")):
-    """Problems with the cached datasets for `processing_params`.
-
-    An empty list means the caches are usable. The test is exactly the one the
-    training loop performs: `CachedFeatureDataset` raises when `meta.json`
-    disagrees with the processing parameters, so passing here guarantees a trial
-    can read the cache.
-
-    `pipeline.preprocessing` is imported inside the function on purpose: it
-    pulls in pyarrow and torchvision, which this module otherwise does not need.
-    """
-    from .preprocessing import CachedFeatureDataset      # noqa: PLC0415 (lazy on purpose)
-
-    problems = []
-    for split in splits:
-        path = Path(cache_dir) / split
-        if not (path / "meta.json").is_file():
-            problems.append(f"{split}: no cache at {path}")
-            continue
-        try:
-            CachedFeatureDataset(path, **processing_params)
-        except Exception as exc:                          # disagreement, truncation, ...
-            problems.append(f"{split}: {exc}")
-    return problems
-
-
-def ensure_cache(cache_dir, processing_params, splits=("train", "val"),
-                 rebuild=True, script=None, workers=1, overwrite=True, cwd=None):
-    """Check the caches and rebuild them when they disagree with the parameters.
-
-    Returns ``{"ok": bool, "problems": [...], "rebuilt": bool}`` where ``ok``
-    describes the state *after* the call. Rebuilding runs
-    ``scripts/build_dataset_cache.py``, so it needs the repository layout; the
-    path is derived from this file.
-    """
-    problems = check_cache(cache_dir, processing_params, splits)
-    if not problems:
-        return {"ok": True, "problems": [], "rebuilt": False}
-    if not rebuild:
-        return {"ok": False, "problems": problems, "rebuilt": False}
-
-    script = Path(script or Path(__file__).resolve().parents[1]
-                  / "scripts" / "build_dataset_cache.py")
-    command = [sys.executable, str(script), "--splits", *splits,
-               "--cache-dir", str(Path(cache_dir).resolve())]
-    if overwrite:
-        command.append("--overwrite")
-    command += ["--workers", str(workers)]
-
-    logger.info("rebuilding cache: {}", " ".join(command))
-    subprocess.run(command, check=True, cwd=cwd)
-
-    remaining = check_cache(cache_dir, processing_params, splits)
-    return {"ok": not remaining, "problems": problems + remaining, "rebuilt": True}
-
-
-def build_cache(cache_dir, processing_parameters, dataset_factory, batch_size=64,
-                    dataset_workers=4, dtype=torch.float32,
-                overwrite=False, log_every=250):
-    """Write a fixed-size-record binary cache from a DataLoader over dataset(**processing_parameters).
-
-    `dtype` must be torch.float32 or torch.float16.
-    torch.uint8 is not supported because features need to be normalised to [0, 1]
-    and casting uint8 -> float32 is lossy.
-
-    """
-    if dtype is torch.uint8:
-        raise ValueError(
-            "dtype=torch.uint8 is not supported: lossy data conversion [0, 1] ")
-
-    def _fingerprint(payload):
-        blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-        return hashlib.sha256(blob).hexdigest()[:16]
-
-    cache_dir = Path(cache_dir)
-    if cache_dir.exists() and any(cache_dir.iterdir()) and not overwrite:
-        raise FileExistsError(f"{cache_dir} already has files; pass overwrite=True")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    samples_tmp = cache_dir / "samples.bin.tmp"
-    labels_tmp = cache_dir / "labels.npy.tmp"
-    meta_tmp = cache_dir / "meta.json.tmp"
-    for stale in (samples_tmp, labels_tmp, meta_tmp):
-        stale.unlink(missing_ok=True)
-    if overwrite:
-        (cache_dir / "meta.json").unlink(missing_ok=True)   # invalidate the previous cache
-
-    dataset = dataset_factory(**processing_parameters)
-    loader = DataLoader(dataset, batch_size=batch_size, num_workers=dataset_workers)
-
-    order, layout = [], {}
-    record_bytes = 0
-    labels = []
-    written = 0
-    started = time.perf_counter()
-
-    try:
-        with open(samples_tmp, "wb") as sink:
-            for features, label in iter_samples(loader):
-                if not layout:
-                    if not features:
-                        raise ValueError("dataset yielded a sample with no features")
-                    order = list(features)
-                    offset = 0
-                    for name in order:
-                        tensor = torch.as_tensor(features[name])
-                        feature_dtype = dtype
-                        nbytes = tensor.numel() * torch.empty((), dtype=feature_dtype).element_size()
-                        layout[name] = {"shape": tuple(tensor.shape), "dtype": feature_dtype,
-                                        "offset": offset, "nbytes": nbytes}
-                        offset += nbytes
-                    record_bytes = offset
-
-                blobs = []
-                for name in order:
-                    spec = layout[name]
-                    tensor = torch.as_tensor(features[name]).detach().cpu()
-                    shape = tuple(tensor.shape)
-                    if shape != spec["shape"]:
-                        raise ValueError(
-                            f"feature {name!r} has shape {shape}, expected {spec['shape']} "
-                            f"(from the first sample). A cache needs fixed-size records: resample "
-                            f"every sample to one size, or drop the varying feature.")
-                    target_dtype = spec["dtype"]
-                    if tensor.dtype != target_dtype:
-                        tensor = tensor.to(target_dtype)
-
-                    blobs.append(tensor.contiguous().numpy().tobytes())
-                record = b"".join(blobs)
-                if len(record) != record_bytes:
-                    raise RuntimeError(f"sample {written} serialized to {len(record)} bytes, "
-                                       f"expected {record_bytes}")
-                sink.write(record)
-
-                labels.append(int(label))
-                written += 1
-                if log_every and written % int(log_every) == 0:
-                    elapsed = max(time.perf_counter() - started, 1e-9)
-                    print(f"[cache] {written} samples | {written / elapsed:.1f}/s | "
-                          f"{written * record_bytes / 2 ** 30:.2f} GiB")
-
-        if written == 0:
-            raise ValueError("dataset produced no samples; nothing to cache")
-        expected = written * record_bytes
-        actual = samples_tmp.stat().st_size
-        if actual != expected:
-            raise RuntimeError(f"{samples_tmp} is {actual} bytes, "
-                               f"expected {expected} ({written} x {record_bytes})")
-
-        with open(labels_tmp, "wb") as sink:
-            np.save(sink, np.asarray(labels, dtype=np.int64))
-    except BaseException:
-        for stale in (samples_tmp, labels_tmp, meta_tmp):
-            stale.unlink(missing_ok=True)
-        raise
-
-    elapsed = time.perf_counter() - started
-    feature_layout = {name: {"shape": list(spec["shape"]),
-                             "dtype": str(spec["dtype"]).replace("torch.", ""),
-                             "offset": spec["offset"],
-                             "nbytes": spec["nbytes"]}
-                      for name, spec in layout.items()}
-    meta = {"created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "fingerprint": _fingerprint({"processing_parameters": processing_parameters,
-                                         "feature_order": order,
-                                         "features": feature_layout}),
-            "n_samples": written,
-            "record_bytes": record_bytes,
-            "label_dtype": "int64",
-            "feature_order": order,
-            "features": feature_layout,
-            "config": processing_parameters,
-            "source": {"n_samples": len(dataset) if hasattr(dataset, "__len__") else written,
-                       "processing_parameters": processing_parameters}}
-
-    with open(meta_tmp, "w") as sink:
-        json.dump(meta, sink, indent=2, default=str)
-    os.replace(labels_tmp, cache_dir / "labels.npy")
-    os.replace(samples_tmp, cache_dir / "samples.bin")
-    os.replace(meta_tmp, cache_dir / "meta.json")      # written last = completeness marker
-
-    print(f"[cache] {written} samples -> {cache_dir} | "
-          f"{record_bytes / 2 ** 10:.0f} KiB/sample | "
-          f"{record_bytes * written / 2 ** 30:.2f} GiB | {elapsed:.1f}s")
-    return {"cache_dir": str(cache_dir), "n_samples": written,
-            "record_bytes": record_bytes, "bytes": record_bytes * written,
-            "features": order, "workers": dataset_workers,
-            "dtypes": {name: str(spec["dtype"]).replace("torch.", "") for name, spec in layout.items()},
-            "fingerprint": meta["fingerprint"], "elapsed": elapsed,
-            "samples": str(cache_dir / "samples.bin"),
-            "labels": str(cache_dir / "labels.npy"),
-            "meta": str(cache_dir / "meta.json")}
+def _fingerprint(payload):
+    """Short, stable hash of a JSON-able payload (used to label cached data)."""
+    blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
 

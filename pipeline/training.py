@@ -637,17 +637,24 @@ class Trainer:
     Swapping `tracker=NullTracker()` removes every mlflow call; swapping
     `dataset_factory` / `metric_factory` removes the preprocessing / metric
     dependency. `fit()` is the only stateful entry point.
+
+    extra_params:
+        Values the caller chose that are neither processing nor training
+        parameters (a tuned model size, for example). They are not used for
+        training, only reported: logged as `extra.<key>` and appended to the
+        run name, so two runs with different models stay distinguishable.
     """
 
     def __init__(self, processing, model, training, seed=SEED,
                  eval_fn=None, eval_loader=None, validation=None, tracker=None,
                  dataset_factory=FeatureDataset,
                  metric_factory=make_metrics,
-                 device=None):
+                 device=None, extra_params=None):
         self.proc = dict(processing)
         self.cfg = TrainConfig.from_dict(training)
         self.model_factory = model
         self.seed = int(seed)
+        self.extra_params = dict(extra_params or {})
         self.validation = self._resolve_validation(validation, eval_fn, eval_loader)
         self.tracker = tracker if tracker is not None else NullTracker()
         self.dataset_factory = dataset_factory
@@ -684,12 +691,17 @@ class Trainer:
     # describe for mlflow
     def run_name(self):
         cfg = self.cfg
-        return "{}|{}|bs{}|lr{:g}|seed{}".format(
+        name = "{}|{}|bs{}|lr{:g}|seed{}".format(
             "+".join(str(f) for f in self.proc.get("features", [])),
             self.proc.get("colorspace"), cfg.batch_size, cfg.learning_rate, self.seed)
+        if self.extra_params:                      # keep runs of different models apart
+            extra = ",".join(f"{key}={value}"
+                             for key, value in sorted(self.extra_params.items()))
+            name = f"{name}|{extra}"
+        return name
 
     def tags(self):
-        return {"features": ",".join(str(f) for f in self.proc.get("features", [])),
+        tags = {"features": ",".join(str(f) for f in self.proc.get("features", [])),
                 "colorspace": str(self.proc.get("colorspace")),
                 "labeltype": str(self.proc.get("labeltype")),
                 "augment": str(self.proc.get("augment")),
@@ -698,8 +710,19 @@ class Trainer:
                 "validation": str(getattr(self.validation, "name", "custom")),
                 "resumed_from": str(self.cfg.resume_from or "none")}
 
+        model_name = self.extra_params.get("model")
+        if model_name is None and self.model is not None:
+            model_name = type(self.model).__name__
+        if model_name is not None:
+            tags["model"] = str(model_name)
+        for key, value in self.extra_params.items():
+            if key != "model":
+                tags[f"extra_{key}"] = str(value)
+        return tags
+
     def params(self):
         params = {"seed": self.seed}
+        params.update(_flat_params(self.extra_params, prefix="extra."))
         params.update(_flat_params(self.proc, prefix="proc."))
         params.update(_flat_params(self.cfg.to_dict(), prefix="train."))
         return params
@@ -707,6 +730,7 @@ class Trainer:
     def config_snapshot(self):
         return {"processing": _sanitize(self.proc),
                 "training": _sanitize(self.cfg.to_dict()),
+                "extra": _sanitize(self.extra_params),
                 "seed": self.seed}
 
     # build

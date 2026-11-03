@@ -1,7 +1,6 @@
 x-airflow-common:
   &airflow-common
   image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.3.2-python3.12}
-  # build: .   # uncomment once a Dockerfile adding torch/optuna/mlflow exists
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -10,17 +9,15 @@ x-airflow-common:
     AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
-    # ---------------------------------------------------------------
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    TUNING_REPO: ${TUNING_REPO:-}
+    AIRFLOW__CORE__DAGS_FOLDER: ${PWD}/dags
     PYTHONPATH: /opt/project
-    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
-    AIRFLOW_CONN_OPTUNA_POSTGRES: postgres://${OPTUNA_USER}:${OPTUNA_PASSWORD}@postgres:5432/${OPTUNA_DB:-optuna_db}
+
   volumes:
-    - ./dags:/opt/airflow/dags
+    - ${PWD}/dags:${PWD}/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
     - .:/opt/project
@@ -94,15 +91,13 @@ services:
     <<: *airflow-common
     command: scheduler
     volumes:
-      - ./dags:/opt/airflow/dags
+      - ${PWD}/dags:${PWD}/dags
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
       - .:/opt/project
       - /var/run/docker.sock:/var/run/docker.sock
-    # /var/run/docker.sock is root:docker with mode 660; uid 1000 is not in that
-    # group, so the socket would be unreadable without this.
     group_add:
-      - "952"
+      - "${DOCKER_GID:-952}"
     healthcheck:
       test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
       interval: 10s
@@ -123,18 +118,16 @@ services:
       - -c
       - |
         set -e
-        mkdir -p /opt/airflow/{dags,logs,plugins}
-        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{dags,logs,plugins}
+        mkdir -p /opt/airflow/{logs,plugins}
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{logs,plugins}
         exec /entrypoint airflow version
     environment:
       <<: *airflow-common-env
-      # Airflow 3 renamed the entrypoint flag (_AIRFLOW_DB_UPGRADE -> _AIRFLOW_DB_MIGRATE).
       _AIRFLOW_DB_MIGRATE: 'true'
       _AIRFLOW_WWW_USER_CREATE: 'true'
       _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
       _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
-      _PIP_ADDITIONAL_REQUIREMENTS: ''
-    # Root is required to chown the bind-mounted dags/logs/plugins directories.
+    # Root is required to chown the bind-mounted logs/plugins directories.
     user: "0:0"
 
 volumes:

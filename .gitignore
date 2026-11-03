@@ -3,8 +3,10 @@
 .python-version
 old
 data/*
+mlruns
 **/__pycache__/
 ai_detection.egg-info
-checkpoints
+checkpoints/
+mlruns/
 logs/
 scripts/benchmark.py

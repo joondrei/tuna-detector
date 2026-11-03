@@ -50,9 +50,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from loguru import logger
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
-try:                                   # optional: NullTracker needs no mlflow
+try:                                   
     import mlflow
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors.platform import ResourceDoesNotExist
@@ -63,7 +63,7 @@ from configs.pipeline_config import SEED
 from .preprocessing import FeatureDataset
 from .utils import (_atomic_torch_save, _flat_params, _jsonable, _resolve_device,
                     _sanitize, fixed_rngs, make_metrics, prune_checkpoints,
-                    rng_generator, seed_worker, timeit)
+                    resolve_experiment, rng_generator, seed_worker, timeit)
 
 __all__ = ["TrainConfig", "EarlyStopping", "CheckpointStore", "NullTracker",
            "MlflowTracker", "NullValidator", "CallableValidator", "Evaluator",
@@ -254,13 +254,21 @@ class NullTracker:
 
 
 class MlflowTracker(NullTracker):
-    """Adapter: maps trainer events onto mlflow. """
+    """Adapter: maps trainer events onto mlflow.
+
+    `experiment` is a *name*, not necessarily a full path: a short name such as
+    "resnet18" becomes "<root>/resnet18", where the root is read from
+    MLFLOW_DATABRICKS_ROOT (or MLFLOW_EXPERIMENT_ROOT) and defaults to
+    "/Shared/experiments/ai-detection". A value that already starts with "/"
+    is used unchanged. See `pipeline.utils.resolve_experiment`.
+    """
 
     def __init__(self, tracking_uri=None, experiment=None, run_name=None,
                  log_params=True, log_state_dict=True, log_checkpoints=True,
                  log_history=True, log_system=True, async_logging=True):
         self.tracking_uri = tracking_uri
-        self.experiment = experiment
+        self.experiment = experiment          # short name, or a full /path
+        self.experiment_path = None           # filled in by start()
         self.default_run_name = run_name
         self._log_params = log_params
         self._log_state_dict = log_state_dict
@@ -270,6 +278,17 @@ class MlflowTracker(NullTracker):
         self._async_logging = async_logging
         self._run = None
         self.run_id = None
+
+    def resolve_experiment_path(self):
+        """Full MLflow experiment path for this run.
+
+        A short name ("resnet18") becomes "<MLFLOW_EXPERIMENT_ROOT>/resnet18";
+        """
+        on_databricks = "databricks" in str(mlflow.get_tracking_uri())
+        if self.experiment is None and not on_databricks:
+            return None
+        self.experiment_path = resolve_experiment(self.experiment)
+        return self.experiment_path
 
     def start(self, run_name=None, tags=None):
         if mlflow is None:
@@ -284,25 +303,26 @@ class MlflowTracker(NullTracker):
         if self._log_system:
             mlflow.enable_system_metrics_logging()
             logger.debug(f"MLflow is tracking system metrics.")
-        if self.experiment:
+        experiment = self.resolve_experiment_path()
+        if experiment:
             if mlflow.get_tracking_uri() == "databricks":
                 w = WorkspaceClient()
                 logger.debug("Connected to Databricks")
-                exp_dir = "/".join(self.experiment.split("/")[:-1])
-                try:
-                    w.workspace.get_status(exp_dir)
-                    logger.debug(f"Directory already exists: {exp_dir}")
-                except ResourceDoesNotExist:
-                    w.workspace.mkdirs(exp_dir)
-                    logger.success(f"Directory created: {exp_dir}")
-                except Exception as e:
-                    logger.error(f"Error creating experiment directory")
-                    raise e
-                finally:
-                    mlflow.set_experiment(self.experiment)
-                    logger.success(f"MLflow experiment ready: {self.experiment}")
+                exp_dir = "/".join(experiment.split("/")[:-1])
+                if exp_dir:                 # e.g. /Shared/experiments/ai-detection
+                    try:
+                        w.workspace.get_status(exp_dir)
+                        logger.debug(f"Directory already exists: {exp_dir}")
+                    except ResourceDoesNotExist:
+                        w.workspace.mkdirs(exp_dir)
+                        logger.success(f"Directory created: {exp_dir}")
+                    except Exception as e:
+                        logger.error("Error creating experiment directory")
+                        raise e
+                mlflow.set_experiment(experiment)
+                logger.success(f"MLflow experiment ready: {experiment}")
             else:
-                mlflow.set_experiment(self.experiment)
+                mlflow.set_experiment(experiment)
         self._run = mlflow.start_run(run_name=run_name or self.default_run_name)
         self.run_id = self._run.info.run_id
         if tags:
@@ -725,8 +745,9 @@ class Trainer:
     @timeit
     def _make_loader(self, dataset):
         cfg = self.cfg
+        shuffle = not isinstance(dataset, IterableDataset)
         kwargs = dict(batch_size=cfg.batch_size, num_workers=cfg.dataset_workers,
-                      pin_memory=(self.device.type == "cuda"))
+                      pin_memory=(self.device.type == "cuda"), shuffle=shuffle)
         if cfg.dataset_workers > 0:            # reproducible worker RNG / augmentation
             kwargs.update(generator=self.gen, worker_init_fn=seed_worker)
         return DataLoader(dataset, **kwargs)

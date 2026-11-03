@@ -1,0 +1,10 @@
+.venv/
+data/
+checkpoints/
+old/
+logs/
+mlruns/
+.git/
+**/__pycache__/
+*.ipynb
+.env

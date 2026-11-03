@@ -1,5 +1,7 @@
 import os
 import random
+import subprocess
+import sys
 from pathlib import Path
 import hashlib
 import json
@@ -22,7 +24,36 @@ R = TypeVar("R")
 
 __all__ = ["fixed_rngs", "seed_worker", "make_metrics", "rng_generator",
            "prune_checkpoints", "_resolve_device", "_sanitize", "_atomic_torch_save",
-           "_summary", "_flat_params", "_jsonable"]
+           "_summary", "_flat_params", "_jsonable", "resolve_experiment",
+           "DEFAULT_MLFLOW_EXPERIMENT_ROOT", "check_cache", "ensure_cache"]
+
+
+# mlflow experiment naming
+DEFAULT_MLFLOW_EXPERIMENT_ROOT = "/Shared/experiments/ai-detection"
+
+
+def resolve_experiment(name=None, root=None):
+    """Turn a short experiment name into a full MLflow experiment path.
+
+    resolve_experiment(None)                -> "/Shared/experiments/ai-detection"
+    resolve_experiment("resnet18")          -> "/Shared/experiments/ai-detection/resnet18"
+    resolve_experiment("/Users/me/my_exp")  -> "/Users/me/my_exp"  (full path wins)
+    resolve_experiment("resnet18", root="/tmp/x") -> "/tmp/x/resnet18"
+
+    The root, in order of precedence: the `root` argument, the
+    MLFLOW_EXPERIMENT_ROOT environment variable, MLFLOW_DATABRICKS_ROOT, then
+    DEFAULT_MLFLOW_EXPERIMENT_ROOT. Read at call time, so a .env file loaded by
+    the caller is honoured.
+    """
+    root = (root or os.environ.get("MLFLOW_EXPERIMENT_ROOT")
+            or os.environ.get("MLFLOW_DATABRICKS_ROOT")
+            or DEFAULT_MLFLOW_EXPERIMENT_ROOT).strip().rstrip("/")
+    if name is None or str(name).strip() == "":
+        return root
+    name = str(name).strip()
+    if name.startswith("/"):            # already a full path
+        return name.rstrip("/")
+    return f"{root}/{name.strip('/')}"
 
 
 # rngs
@@ -221,9 +252,66 @@ def iter_samples(loader):
         for i in range(flat.shape[0]):
             yield {name: value[i] for name, value in features.items()}, flat[i]
 
-def build_cache(cache_dir, processing_params, processor, dtype=torch.float32,
+def check_cache(cache_dir, processing_params, splits=("train", "val")):
+    """Problems with the cached datasets for `processing_params`.
+
+    An empty list means the caches are usable. The test is exactly the one the
+    training loop performs: `CachedFeatureDataset` raises when `meta.json`
+    disagrees with the processing parameters, so passing here guarantees a trial
+    can read the cache.
+
+    `pipeline.preprocessing` is imported inside the function on purpose: it
+    pulls in pyarrow and torchvision, which this module otherwise does not need.
+    """
+    from .preprocessing import CachedFeatureDataset      # noqa: PLC0415 (lazy on purpose)
+
+    problems = []
+    for split in splits:
+        path = Path(cache_dir) / split
+        if not (path / "meta.json").is_file():
+            problems.append(f"{split}: no cache at {path}")
+            continue
+        try:
+            CachedFeatureDataset(path, **processing_params)
+        except Exception as exc:                          # disagreement, truncation, ...
+            problems.append(f"{split}: {exc}")
+    return problems
+
+
+def ensure_cache(cache_dir, processing_params, splits=("train", "val"),
+                 rebuild=True, script=None, workers=1, overwrite=True, cwd=None):
+    """Check the caches and rebuild them when they disagree with the parameters.
+
+    Returns ``{"ok": bool, "problems": [...], "rebuilt": bool}`` where ``ok``
+    describes the state *after* the call. Rebuilding runs
+    ``scripts/build_dataset_cache.py``, so it needs the repository layout; the
+    path is derived from this file.
+    """
+    problems = check_cache(cache_dir, processing_params, splits)
+    if not problems:
+        return {"ok": True, "problems": [], "rebuilt": False}
+    if not rebuild:
+        return {"ok": False, "problems": problems, "rebuilt": False}
+
+    script = Path(script or Path(__file__).resolve().parents[1]
+                  / "scripts" / "build_dataset_cache.py")
+    command = [sys.executable, str(script), "--splits", *splits,
+               "--cache-dir", str(Path(cache_dir).resolve())]
+    if overwrite:
+        command.append("--overwrite")
+    command += ["--workers", str(workers)]
+
+    logger.info("rebuilding cache: {}", " ".join(command))
+    subprocess.run(command, check=True, cwd=cwd)
+
+    remaining = check_cache(cache_dir, processing_params, splits)
+    return {"ok": not remaining, "problems": problems + remaining, "rebuilt": True}
+
+
+def build_cache(cache_dir, processing_parameters, dataset_factory, batch_size=64,
+                    dataset_workers=4, dtype=torch.float32,
                 overwrite=False, log_every=250):
-    """Write a fixed-size-record binary cache from a DataLoader over processor(**processing_params).
+    """Write a fixed-size-record binary cache from a DataLoader over dataset(**processing_parameters).
 
     `dtype` must be torch.float32 or torch.float16.
     torch.uint8 is not supported because features need to be normalised to [0, 1]
@@ -232,7 +320,7 @@ def build_cache(cache_dir, processing_params, processor, dtype=torch.float32,
     """
     if dtype is torch.uint8:
         raise ValueError(
-            "dtype=torch.uint8 is not supported: casting normalised features in [0, 1] ")
+            "dtype=torch.uint8 is not supported: lossy data conversion [0, 1] ")
 
     def _fingerprint(payload):
         blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -251,8 +339,8 @@ def build_cache(cache_dir, processing_params, processor, dtype=torch.float32,
     if overwrite:
         (cache_dir / "meta.json").unlink(missing_ok=True)   # invalidate the previous cache
 
-    dataset = processor(**processing_params)
-    loader = DataLoader(dataset, batch_size=64, num_workers=0)
+    dataset = dataset_factory(**processing_parameters)
+    loader = DataLoader(dataset, batch_size=batch_size, num_workers=dataset_workers)
 
     order, layout = [], {}
     record_bytes = 0
@@ -327,7 +415,7 @@ def build_cache(cache_dir, processing_params, processor, dtype=torch.float32,
                              "nbytes": spec["nbytes"]}
                       for name, spec in layout.items()}
     meta = {"created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "fingerprint": _fingerprint({"processing_params": processing_params,
+            "fingerprint": _fingerprint({"processing_parameters": processing_parameters,
                                          "feature_order": order,
                                          "features": feature_layout}),
             "n_samples": written,
@@ -335,9 +423,9 @@ def build_cache(cache_dir, processing_params, processor, dtype=torch.float32,
             "label_dtype": "int64",
             "feature_order": order,
             "features": feature_layout,
-            "config": processing_params,
+            "config": processing_parameters,
             "source": {"n_samples": len(dataset) if hasattr(dataset, "__len__") else written,
-                       "processing_params": processing_params}}
+                       "processing_parameters": processing_parameters}}
 
     with open(meta_tmp, "w") as sink:
         json.dump(meta, sink, indent=2, default=str)
@@ -350,9 +438,10 @@ def build_cache(cache_dir, processing_params, processor, dtype=torch.float32,
           f"{record_bytes * written / 2 ** 30:.2f} GiB | {elapsed:.1f}s")
     return {"cache_dir": str(cache_dir), "n_samples": written,
             "record_bytes": record_bytes, "bytes": record_bytes * written,
-            "features": order, "workers": 0,
+            "features": order, "workers": dataset_workers,
             "dtypes": {name: str(spec["dtype"]).replace("torch.", "") for name, spec in layout.items()},
             "fingerprint": meta["fingerprint"], "elapsed": elapsed,
             "samples": str(cache_dir / "samples.bin"),
             "labels": str(cache_dir / "labels.npy"),
             "meta": str(cache_dir / "meta.json")}
+

@@ -1,0 +1,141 @@
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.3.2-python3.12}
+  # build: .   # uncomment once a Dockerfile adding torch/optuna/mlflow exists
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-change-me-in-env}
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # ---------------------------------------------------------------
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    TUNING_REPO: ${TUNING_REPO:-}
+    PYTHONPATH: /opt/project
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+    AIRFLOW_CONN_OPTUNA_POSTGRES: postgres://${OPTUNA_USER}:${OPTUNA_PASSWORD}@postgres:5432/${OPTUNA_DB:-optuna_db}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - .:/opt/project
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    entrypoint: >
+      bash -c "
+      mkdir -p /docker-entrypoint-initdb.d &&
+      echo \"
+        CREATE DATABASE ${OPTUNA_DB:-optuna_db};
+        CREATE USER ${OPTUNA_USER:-optuna} WITH PASSWORD '${OPTUNA_PASSWORD:-tuna}';
+        GRANT ALL PRIVILEGES ON DATABASE ${OPTUNA_DB:-optuna_db} TO ${OPTUNA_USER:-optuna};
+        GRANT ALL ON SCHEMA public TO ${OPTUNA_USER:-optuna};
+      \" > /docker-entrypoint-initdb.d/01_init_optuna.sql &&
+      exec /usr/local/bin/docker-entrypoint.sh postgres
+      "
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"  
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    restart: always
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - 8086:8080
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - .:/opt/project
+      - /var/run/docker.sock:/var/run/docker.sock
+    # /var/run/docker.sock is root:docker with mode 660; uid 1000 is not in that
+    # group, so the socket would be unreadable without this.
+    group_add:
+      - "952"
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    # One-shot bootstrap: prepare the bind-mounted dirs, migrate the metadata DB
+    # and create the UI user. Every other service waits for this to exit 0.
+    command:
+      - -c
+      - |
+        set -e
+        mkdir -p /opt/airflow/{dags,logs,plugins}
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{dags,logs,plugins}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      # Airflow 3 renamed the entrypoint flag (_AIRFLOW_DB_UPGRADE -> _AIRFLOW_DB_MIGRATE).
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    # Root is required to chown the bind-mounted dags/logs/plugins directories.
+    user: "0:0"
+
+volumes:
+  postgres-db-volume:

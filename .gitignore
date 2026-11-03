@@ -9,4 +9,3 @@ ai_detection.egg-info
 checkpoints/
 mlruns/
 logs/
-scripts/benchmark.py

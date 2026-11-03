@@ -1,6 +1,6 @@
 # AI image detection
 
-Master's thesis repo — the training cycle is somewhat done.
+repo for my master's thesis training cycle
 
 Full training pipeline featuring patch-based noise extraction, with options for live preprocessing or cache generation.
 
